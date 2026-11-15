@@ -33,6 +33,24 @@ Google 会根据账号所在国家限制访问。本地 MITM 代理会从 `loadC
 | 🧪 **CI 验证** | 在真实的 Linux / macOS / Windows 上跑完整流程：安装 → 更新 → 自愈 → 卸载 |
 | 🧹 **干净卸载** | `uninstall` 会还原二进制文件并删除其余所有内容 |
 
+## 🎯 修复什么
+
+只修复**一件事** —— Antigravity CLI 启动后立即显示的地区警告：
+
+<div align="center">
+<img src="assets/warning.svg" width="720" alt="之前：Eligibility check failed，账号在你所在地区不可用。之后：agy 正常回复。">
+<br><sub>消息与效果的示意图，并非真实截图。</sub>
+</div>
+
+> `Eligibility check failed: Your current account is not eligible for Antigravity, because it is not currently available in your location.`
+
+| ✅ 能修复 | ❌ 不能修复 |
+|---|---|
+| 上面的地区 **Eligibility Check** 错误 | 登录 —— 仍然需要可用的 `agy login` |
+| | 订阅、配额或速率限制 |
+| | 模型可用性或任何账号的服务端限制 |
+| | 其他任何错误 —— 如果提示不同，本工具无法解决 |
+
 ## 🚀 安装
 
 请先安装并登录 Antigravity CLI（`agy login`），然后：

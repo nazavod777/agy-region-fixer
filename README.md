@@ -33,6 +33,24 @@ Google restricts access by the account's country. A local MITM proxy strips `ine
 | 🧪 **CI-tested** | full cycle on real Linux / macOS / Windows: install → update → heal → uninstall |
 | 🧹 **Clean uninstall** | `uninstall` puts the binary back and removes everything else |
 
+## 🎯 What it fixes
+
+Exactly **one** thing — the region warning that Antigravity CLI shows right after start:
+
+<div align="center">
+<img src="assets/warning.svg" width="720" alt="Before: Eligibility check failed because the account is not available in your location. After: agy answers normally.">
+<br><sub>Illustration of the message and of the result, not a literal screenshot.</sub>
+</div>
+
+> `Eligibility check failed: Your current account is not eligible for Antigravity, because it is not currently available in your location.`
+
+| ✅ Fixes | ❌ Does not fix |
+|---|---|
+| The region **Eligibility Check** error above | Login — you still need a working `agy login` |
+| | Subscription, quota or rate limits |
+| | Model availability or any server-side restriction on the account |
+| | Any other error — if the message differs, this tool will not help |
+
 ## 🚀 Installation
 
 Install and log in to Antigravity CLI first (`agy login`), then:
