@@ -91,6 +91,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://raw.git
 - 📦 **任何方式安装的 `agy`** —— 安装脚本像你自己的 shell 一样查找它（`sudo` 会隐藏 `~/.local/bin`、`/snap/bin`、nvm、bun、cargo 等）：
   - 普通二进制文件、npm/brew/cargo 的链接、root 所有的 `/usr/local/bin/agy` → 二进制文件被移到 `agy.real`，由 shim 取代；
   - **snap、Nix**（不能改动的启动器）→ 启动器保持原样，在你的 `PATH` 中更靠前的位置（`~/.local/bin`）放置一个包装脚本。对于 snap，CA 证书会复制到 `~/snap/<名称>/common/agy-region-fixer`，受限应用可以读取该目录。
+- 🪟 **所有支持格式共用一个 Windows 安装脚本：** `install.ps1` 自动识别普通 EXE、npm `.cmd`/`.ps1`、WindowsApps 别名和 Scoop shim，使用 Windows 自带的 .NET Framework 编译器生成真正的 `agy.exe` 包装器。普通二进制保存为 `agy.real.exe`；受管理的启动器保留原名和文件，包装器放在 `%USERPROFILE%\.agy-region-fixer\bin`。旧的 `agy.cmd` 安装会自动迁移。
 - 🐧 Linux：systemd，以及 `runuser` 或 `setpriv`（都包含在 `util-linux` 中）
 
 ## ⚙️ 工作原理
@@ -190,8 +191,7 @@ $env:AGY_BYPASS_PORT="8081"; powershell -ExecutionPolicy Bypass -File install.ps
 
 ## ⚠️ 限制
 
-- 🪟 Windows：只有 `PATH` 中普通的 `agy.exe` 才会安装 shim。对于 npm 的 `.cmd`、WindowsApps 别名或 scoop shim，安装脚本会报告找到了什么，并给出手动通过代理运行 `agy` 的命令。
-- 🪟 Windows：shim 是 `agy.cmd`。通过 CreateProcess 严格调用 `agy.exe`（绕过 `PATHEXT` 解析）的程序看不到它。CLI 和 PowerShell 正常工作。
+- 🪟 Windows 启动器模式安装后，请打开新终端以使用更新后的用户 `PATH`。程序需要解析到已安装的 `agy.exe` 包装器，或通过其完整路径启动；直接调用原始启动器的绝对路径会绕过包装器。系统 `PATH` 可能优先于用户 `PATH`，请检查应用实际找到的 `agy`。
 - 🧬 如果 Google 更改响应格式（字段改名或改用二进制 proto），插件将停止清理；在 `addon.py` 中改一行即可修复。
 - 📌 如果 `agy` 启用证书固定（Go 客户端几乎从不这样做），此方案需要重做。
 

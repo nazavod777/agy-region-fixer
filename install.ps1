@@ -11,7 +11,7 @@
 #
 # How it works: a local MITM proxy (mitmproxy) strips ineligibleTiers
 # from Google loadCodeAssist responses. The agy.exe binary is NOT modified.
-# The shim (agy.cmd + agy.real.exe) is self-healed by a scheduled task
+# The native agy.exe shim supports binaries and managed launchers and is healed
 # every 5 minutes after CLI updates.
 #
 # The proxy addon lives in addon.py next to this script (in the repo); for a
@@ -36,15 +36,6 @@ function WriteNoBom($path, $text) {
 # Cyrillic in the profile path turns into garbage
 function WriteBom($path, $text) {
   [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($true))
-}
-# OEM code page of the console (the one cmd.exe uses when reading a .cmd)
-function Get-OemEncoding {
-  $codePage = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage' -ErrorAction SilentlyContinue).OEMCP
-  # OEMCP 65001 ("Unicode UTF-8" enabled in regional settings): GetEncoding would return
-  # an encoding with a BOM, and cmd.exe does not understand a BOM at the start of a .cmd ("@echo off" breaks)
-  if ($codePage -eq 65001) { return [Text.UTF8Encoding]::new($false) }
-  if ($codePage) { try { return [Text.Encoding]::GetEncoding([int]$codePage) } catch {} }
-  return [Text.Encoding]::ASCII
 }
 # contents of a Python string literal (double-quoted): \ and " are escaped,
 # otherwise "C:\Users\..." gives a SyntaxError (\U starts a unicode escape)
@@ -235,123 +226,924 @@ for ($i=0; $i -lt 20; $i++) {
 }
 if ($mitmOk) { Say "proxy is alive, MITM works" } else { Say "MITM check failed — continuing (check $PREFIX\mitm-stdout.log later)" }
 
-# --- shim ------------------------------------------------------------------
-Say "4/6 Shim for agy (agy.cmd + agy.real.exe)"
-function Get-ShimContent($port, $caPath) {
-  # setlocal: proxy variables must not stay in the cmd.exe session after the CLI exits
-  return @"
-@echo off
-setlocal
-REM agy-region-fixer-shim
-curl.exe -s --noproxy * -o nul --max-time 1 http://127.0.0.1:$port/
-if not errorlevel 1 (
-  set "SSL_CERT_FILE=$caPath"
-  set "HTTPS_PROXY=http://127.0.0.1:$port"
-)
-"%~dp0agy.real.exe" %*
-"@
+# The native launcher and its lifecycle helpers are embedded: this installer is
+# the only Windows entrypoint for every supported CLI installation format.
+$windowsSupportSource = @'
+# Windows PowerShell 5.1 support for the native agy launcher. Dot-source only.
+
+function Test-AgyNativeShim {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  # App Execution Aliases can be zero-length reparse points, not readable PE files.
+  if ($Path -match '(?i)[\\/]WindowsApps[\\/]') { return $false }
+  if (-not [IO.File]::Exists($Path)) { return $false }
+  try {
+    return [Diagnostics.FileVersionInfo]::GetVersionInfo($Path).FileDescription -ceq 'agy-region-fixer-native-shim-v1'
+  } catch { return $false }
 }
-# cmd.exe reads a .cmd in the OEM code page, not UTF-8 and not ASCII: Cyrillic
-# in the profile path would otherwise turn into "?". The finished shim text is kept as a template —
-# install and heal copy it byte for byte
-$oem = Get-OemEncoding
-$shimText = (Get-ShimContent $PORT $ca) -replace "`r?`n", "`r`n"
-if ($oem.GetString($oem.GetBytes($shimText)) -ne $shimText) {
-  Say "WARNING: the CA path contains characters outside the cmd.exe OEM encoding ($($oem.WebName)) — the shim may not find the certificate; install from a profile with a plain path"
+
+function Get-AgyFullPath {
+  param([string]$Path)
+  if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathRooted($Path)) {
+    throw "An absolute path is required: $Path"
+  }
+  return [IO.Path]::GetFullPath($Path)
 }
-$shimTpl = Join-Path $PREFIX "agy.cmd.tpl"
-[IO.File]::WriteAllText($shimTpl, $shimText, $oem)
-function Save-ShimPath($path) {
-  # UTF-8 with BOM: PowerShell 5.1 reads such a file (Get-Content -Encoding UTF8) without loss
-  WriteBom (Join-Path $PREFIX "shim.path") ($path + "`r`n")
+
+function Test-AgySamePath {
+  param([string]$Left, [string]$Right)
+  return [string]::Equals([IO.Path]::GetFullPath($Left).TrimEnd('\', '/'), [IO.Path]::GetFullPath($Right).TrimEnd('\', '/'), [StringComparison]::OrdinalIgnoreCase)
 }
-$cmd = Get-Command agy -ErrorAction SilentlyContinue
-$shimPath = $null
-function Test-AgyLauncher($path) {
-  if ($path -match '[\\/]WindowsApps[\\/]') { return $true }
-  # Scoop launchers resolve a neighbouring .shim file and must keep their original name.
-  if ($path -like "*.exe" -and (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($path, ".shim")))) { return $true }
+
+function Assert-AgyRegularFile {
+  param([string]$Path)
+  if ([IO.File]::Exists($Path)) {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      throw "Refusing to replace a linked file: $Path"
+    }
+  } elseif ([IO.Directory]::Exists($Path)) { throw "Expected a file, found a directory: $Path" }
+}
+
+function Invoke-AgyShimLock {
+  param([string]$Prefix, [scriptblock]$Action)
+  $Prefix = Get-AgyFullPath $Prefix
+  if (-not [IO.Directory]::Exists($Prefix)) { throw "Installation directory does not exist: $Prefix" }
+  $lockPath = Join-Path $Prefix 'shim.lock'
+  Assert-AgyRegularFile $lockPath
+  $watch = [Diagnostics.Stopwatch]::StartNew()
+  $lock = $null
+  while ($null -eq $lock) {
+    try { $lock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch [IO.IOException] {
+      if ($watch.ElapsedMilliseconds -ge 10000) { throw "Timed out after 10 seconds waiting for the shim lock: $lockPath" }
+      Start-Sleep -Milliseconds 100
+    }
+  }
+  try { & $Action $Prefix }
+  finally { $lock.Dispose() }
+}
+
+function Get-AgyUniquePath {
+  param([string]$Path, [string]$Role = 'stage')
+  return "$Path.agy-$Role-$([Guid]::NewGuid().ToString('N'))"
+}
+
+function New-AgyTransaction {
+  return [pscustomobject]@{ Changes = (New-Object 'Collections.Generic.List[object]'); Temps = (New-Object 'Collections.Generic.List[string]'); Committed = $false }
+}
+
+function New-AgyStagedCopy {
+  param($Transaction, [string]$Source, [string]$Destination)
+  $stage = Get-AgyUniquePath $Destination
+  $Transaction.Temps.Add($stage)
+  [IO.File]::Copy($Source, $stage, $false)
+  return $stage
+}
+
+function New-AgyStagedJson {
+  param($Transaction, [string]$Destination, $Value)
+  $stage = Get-AgyUniquePath $Destination
+  $Transaction.Temps.Add($stage)
+  [IO.File]::WriteAllText($stage, ($Value | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false)))
+  return $stage
+}
+
+function Set-AgyTransactionFile {
+  param($Transaction, [string]$Path, [string]$Stage)
+  Assert-AgyRegularFile $Path
+  $exists = [IO.File]::Exists($Path)
+  $backup = Get-AgyUniquePath $Path 'rollback'
+  if ($exists) { [IO.File]::Replace($Stage, $Path, $backup) }
+  else { [IO.File]::Move($Stage, $Path) }
+  $Transaction.Changes.Add([pscustomobject]@{ Path = $Path; Backup = $backup; Existed = $exists })
+}
+
+function Remove-AgyTransactionFile {
+  param($Transaction, [string]$Path)
+  Assert-AgyRegularFile $Path
+  if (-not [IO.File]::Exists($Path)) { return }
+  $backup = Get-AgyUniquePath $Path 'rollback'
+  [IO.File]::Move($Path, $backup)
+  $Transaction.Changes.Add([pscustomobject]@{ Path = $Path; Backup = $backup; Existed = $true })
+}
+
+function Complete-AgyTransaction {
+  param($Transaction)
+  $Transaction.Committed = $true
+  foreach ($change in $Transaction.Changes) {
+    if ([IO.File]::Exists($change.Backup)) { [IO.File]::Delete($change.Backup) }
+  }
+}
+
+function Undo-AgyTransaction {
+  param($Transaction)
+  if ($Transaction.Committed) { return }
+  $failures = New-Object 'Collections.Generic.List[string]'
+  for ($i = $Transaction.Changes.Count - 1; $i -ge 0; $i--) {
+    $change = $Transaction.Changes[$i]
+    try {
+      if ($change.Existed) {
+        if ([IO.File]::Exists($change.Path)) { [IO.File]::Replace($change.Backup, $change.Path, [NullString]::Value) }
+        else { [IO.File]::Move($change.Backup, $change.Path) }
+      } elseif ([IO.File]::Exists($change.Path)) { [IO.File]::Delete($change.Path) }
+    } catch { $failures.Add("$($change.Path): $($_.Exception.Message)") }
+  }
+  if ($failures.Count) { throw "Shim rollback failed; recovery copies were preserved. $($failures -join '; ')" }
+}
+
+function Clear-AgyTransactionTemps {
+  param($Transaction)
+  foreach ($path in $Transaction.Temps) {
+    if ([IO.File]::Exists($path)) { [IO.File]::Delete($path) }
+  }
+}
+
+function Undo-AgyFailedOperation {
+  param($Transaction, $Failure, [bool]$RestorePaths = $false, [AllowNull()][string]$UserPath, [AllowNull()][string]$ProcessPath)
+  $failures = New-Object 'Collections.Generic.List[string]'
+  if (-not $Transaction.Committed) {
+    if ($RestorePaths) {
+      try { Set-AgyUserPath -Value $UserPath }
+      catch { $failures.Add("User PATH: $($_.Exception.Message)") }
+      try { $env:Path = $ProcessPath }
+      catch { $failures.Add("Process PATH: $($_.Exception.Message)") }
+    }
+    # A registry failure must never prevent restoring the executable and its backup.
+    try { Undo-AgyTransaction $Transaction }
+    catch { $failures.Add($_.Exception.Message) }
+  }
+  if ($failures.Count) { throw "Shim operation failed: $($Failure.Exception.Message). Recovery also failed: $($failures -join '; ')" }
+  throw $Failure
+}
+
+function Read-AgyJson {
+  param([string]$Path)
+  if ((Get-Item -LiteralPath $Path -Force -ErrorAction Stop).Length -gt 65536) { throw "Shim configuration is too large: $Path" }
+  try { return [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8) | ConvertFrom-Json -ErrorAction Stop }
+  catch { throw "Cannot read shim configuration ${Path}: $($_.Exception.Message)" }
+}
+
+function Read-AgyLauncherConfig {
+  param([string]$Path)
+  $config = Read-AgyJson $Path
+  if ($config.version -ne 1 -or @('exe', 'cmd', 'ps1') -notcontains $config.kind -or ($config.port -isnot [int] -and $config.port -isnot [long]) -or $config.port -lt 1 -or $config.port -gt 65535) {
+    throw "Unsupported launcher configuration: $Path"
+  }
+  $config.target = Get-AgyFullPath $config.target
+  $config.certificate = Get-AgyFullPath $config.certificate
+  return $config
+}
+
+function Read-AgyShimState {
+  param([string]$Prefix)
+  $path = Join-Path $Prefix 'shim-state.json'
+  if (-not [IO.File]::Exists($path)) { return $null }
+  $state = Read-AgyJson $path
+  if ($state.version -ne 1 -or @('inplace', 'overlay') -notcontains $state.mode -or @('exe', 'cmd', 'ps1') -notcontains $state.kind) {
+    throw "Unsupported shim state: $path"
+  }
+  $defaults = @{ pathAdded = $false; processPathAdded = $false; pathEntry = $null; sourceHash = $null; legacyPath = $null }
+  foreach ($name in $defaults.Keys) {
+    if ($null -eq $state.PSObject.Properties[$name]) { $state | Add-Member -NotePropertyName $name -NotePropertyValue $defaults[$name] }
+  }
+  $state.shimPath = Get-AgyFullPath $state.shimPath
+  $state.target = Get-AgyFullPath $state.target
+  if ($state.mode -eq 'inplace') {
+    $real = Join-Path (Split-Path -Parent $state.shimPath) 'agy.real.exe'
+    if ($state.kind -ne 'exe' -or -not (Test-AgySamePath $state.target $real) -or [IO.Path]::GetFileName($state.shimPath) -ine 'agy.exe') {
+      throw "Invalid in-place shim state: $path"
+    }
+  } else {
+    if (-not (Test-AgySamePath $state.shimPath (Join-Path $Prefix 'bin\agy.exe')) -or (Test-AgySamePath $state.target $state.shimPath)) {
+      throw "Invalid overlay shim state: $path"
+    }
+    if (-not $state.pathEntry) { $state.pathEntry = Join-Path $Prefix 'bin' }
+    if (-not (Test-AgySamePath $state.pathEntry (Join-Path $Prefix 'bin'))) {
+      throw "Invalid PATH ownership in shim state: $path"
+    }
+  }
+  return $state
+}
+
+function Assert-AgyOwnedConfig {
+  param($State)
+  $path = Join-Path (Split-Path -Parent $State.shimPath) 'agy-launcher.json'
+  if ([IO.File]::Exists($path)) {
+    $config = Read-AgyLauncherConfig $path
+    if (-not (Test-AgySamePath $config.target $State.target) -or $config.kind -cne $State.kind) {
+      throw "Refusing to replace a foreign launcher configuration: $path"
+    }
+  }
+  return $path
+}
+
+function Test-AgyLegacyShim {
+  param([string]$Path)
+  if (-not [IO.File]::Exists($Path) -or [IO.Path]::GetExtension($Path) -ine '.cmd') { return $false }
+  $stream = [IO.File]::OpenRead($Path)
+  try {
+    $bytes = New-Object byte[] 8192
+    $count = $stream.Read($bytes, 0, $bytes.Length)
+    return [Text.Encoding]::ASCII.GetString($bytes, 0, $count) -match '(?im)^\s*REM agy-region-fixer-shim\s*$'
+  } finally { $stream.Dispose() }
+}
+
+function Read-AgyLegacyState {
+  param([string]$Prefix)
+  $saved = Join-Path $Prefix 'shim.path'
+  if (-not [IO.File]::Exists($saved)) { return $null }
+  $path = Get-AgyFullPath (([IO.File]::ReadAllText($saved, [Text.Encoding]::UTF8) -split '\r?\n')[0].Trim())
+  if (-not (Test-AgyLegacyShim $path)) { throw "The saved legacy shim is missing or is not owned: $path" }
+  $dir = Split-Path -Parent $path
+  $target = Join-Path $dir 'agy.real.exe'
+  if (-not [IO.File]::Exists($target) -or (Test-AgyNativeShim $target)) { throw "The legacy original binary is missing or invalid: $target" }
+  return [pscustomobject]@{ version = 1; mode = 'inplace'; shimPath = (Join-Path $dir 'agy.exe'); target = $target; kind = 'exe'; pathAdded = $false; pathEntry = $null; legacyPath = $path }
+}
+
+function Get-AgyCommandTarget {
+  param([string]$Prefix)
+  $overlay = Join-Path $Prefix 'bin\agy.exe'
+  $commands = @(Get-Command agy -All -CommandType Application, ExternalScript -ErrorAction SilentlyContinue)
+  foreach ($command in $commands) {
+    $path = $command.Source
+    if ([string]::IsNullOrWhiteSpace($path)) { $path = $command.Path }
+    if ([string]::IsNullOrWhiteSpace($path)) { continue }
+    $path = Get-AgyFullPath $path
+    if ((Test-AgySamePath $path $overlay) -or (Test-AgyNativeShim $path)) { continue }
+    $extension = [IO.Path]::GetExtension($path).ToLowerInvariant()
+    if (@('.exe', '.cmd', '.ps1') -notcontains $extension -or (Test-AgyLegacyShim $path)) { continue }
+    $kind = $extension.Substring(1)
+    $managed = $path -match '(?i)[\\/]WindowsApps[\\/]' -or ($extension -eq '.exe' -and [IO.File]::Exists([IO.Path]::ChangeExtension($path, '.shim')))
+    if ($kind -eq 'exe' -and -not $managed) {
+      return [pscustomobject]@{ version = 1; mode = 'inplace'; shimPath = $path; target = (Join-Path (Split-Path -Parent $path) 'agy.real.exe'); kind = 'exe'; pathAdded = $false; pathEntry = $null }
+    }
+    return [pscustomobject]@{ version = 1; mode = 'overlay'; shimPath = $overlay; target = $path; kind = $kind; pathAdded = $false; pathEntry = (Join-Path $Prefix 'bin') }
+  }
+  throw 'agy was not found in PATH. Install Antigravity CLI and run the installer again.'
+}
+
+function Get-AgyUserPath { return [Environment]::GetEnvironmentVariable('Path', 'User') }
+function Set-AgyUserPath { param([AllowNull()][string]$Value) [Environment]::SetEnvironmentVariable('Path', $Value, 'User') }
+
+function Send-AgyEnvironmentChange {
+  # Existing shells keep their own environment. This notifies Explorer and new apps.
+  try {
+    if (-not ('AgyEnvironmentNotification' -as [type])) {
+      Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class AgyEnvironmentNotification { [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr wParam, string lParam, uint flags, uint timeout, out UIntPtr result); }' -ErrorAction Stop
+    }
+    $result = [UIntPtr]::Zero
+    [void][AgyEnvironmentNotification]::SendMessageTimeout([IntPtr]65535, 0x001A, [UIntPtr]::Zero, 'Environment', 2, 1000, [ref]$result)
+  } catch { Write-Warning "Could not notify other applications about PATH: $($_.Exception.Message)" }
+}
+
+function Test-AgyPathEntry {
+  param([string]$Entry, [string]$Path)
+  if ([string]::IsNullOrWhiteSpace($Entry)) { return $false }
+  try { return Test-AgySamePath ([Environment]::ExpandEnvironmentVariables($Entry.Trim().Trim('"'))) $Path }
+  catch { return $false }
+}
+
+function Get-AgyPathWithoutEntry {
+  param([AllowNull()][string]$Value, [string]$Entry)
+  return (@($Value -split ';' | Where-Object { -not (Test-AgyPathEntry $_ $Entry) }) -join ';')
+}
+
+function Test-AgyPathContains {
+  param([AllowNull()][string]$Value, [string]$Entry)
+  return @($Value -split ';' | Where-Object { Test-AgyPathEntry $_ $Entry }).Count -gt 0
+}
+
+function Add-AgyOverlayPath {
+  param($State)
+  $entry = $State.pathEntry
+  $userPath = Get-AgyUserPath
+  $processPath = $env:Path
+  if (-not (Test-AgyPathContains $userPath $entry)) { $State.pathAdded = $true }
+  if (-not (Test-AgyPathContains $processPath $entry)) { $State | Add-Member -NotePropertyName processPathAdded -NotePropertyValue $true -Force }
+  $nextUser = $entry
+  $remainingUser = Get-AgyPathWithoutEntry $userPath $entry
+  if ($remainingUser) { $nextUser += ';' + $remainingUser }
+  if ($nextUser -cne $userPath) { Set-AgyUserPath -Value $nextUser }
+  $remainingProcess = Get-AgyPathWithoutEntry $processPath $entry
+  $env:Path = $entry
+  if ($remainingProcess) { $env:Path += ';' + $remainingProcess }
+}
+
+function Get-AgyNativeTemplate {
+  param([string]$Prefix, [string]$SourcePath, $State, $Transaction)
+  $SourcePath = Get-AgyFullPath $SourcePath
+  if (-not [IO.File]::Exists($SourcePath)) { throw "Native launcher source is missing: $SourcePath" }
+  $sourceHash = (Get-FileHash -LiteralPath $SourcePath -Algorithm SHA256 -ErrorAction Stop).Hash
+  $template = Join-Path $Prefix 'agy.exe.tpl'
+  if ($State -and $State.PSObject.Properties['sourceHash'] -and $State.sourceHash -ceq $sourceHash -and (Test-AgyNativeShim $template)) {
+    return [pscustomobject]@{ Path = $template; SourceHash = $sourceHash; Staged = $false }
+  }
+  if ([IO.File]::Exists($template) -and -not (Test-AgyNativeShim $template)) { throw "Refusing to replace a foreign launcher template: $template" }
+  $compiler = $null
+  foreach ($framework in @('Framework64', 'Framework')) {
+    $candidate = Join-Path $env:WINDIR "Microsoft.NET\$framework\v4.0.30319\csc.exe"
+    if ([IO.File]::Exists($candidate)) { $compiler = $candidate; break }
+  }
+  if (-not $compiler) { throw 'The Windows .NET Framework C# compiler was not found.' }
+  $stage = Get-AgyUniquePath $template
+  $stdout = Get-AgyUniquePath (Join-Path $Prefix 'csc.stdout')
+  $stderr = Get-AgyUniquePath (Join-Path $Prefix 'csc.stderr')
+  $Transaction.Temps.Add($stage)
+  $Transaction.Temps.Add($stdout)
+  $Transaction.Temps.Add($stderr)
+  $arguments = '/nologo /target:exe /optimize+ /platform:anycpu /reference:System.Web.Extensions.dll /out:"' + $stage + '" "' + $SourcePath + '"'
+  $process = $null
+  try {
+    $process = Start-Process -FilePath $compiler -ArgumentList $arguments -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    if (-not $process.WaitForExit(30000)) {
+      $process.Kill()
+      [void]$process.WaitForExit(5000)
+      throw 'Native launcher compilation timed out after 30 seconds.'
+    }
+    if ($process.ExitCode -ne 0) {
+      $message = [IO.File]::ReadAllText($stdout) + [IO.File]::ReadAllText($stderr)
+      throw "Native launcher compilation failed (exit $($process.ExitCode)): $message"
+    }
+  } finally {
+    if ($process) {
+      try { if (-not $process.HasExited) { $process.Kill(); [void]$process.WaitForExit(5000) } }
+      finally { $process.Dispose() }
+    }
+  }
+  if (-not (Test-AgyNativeShim $stage)) { throw 'The compiled native launcher has no ownership marker.' }
+  return [pscustomobject]@{ Path = $stage; SourceHash = $sourceHash; Staged = $true }
+}
+
+function Write-AgyHealLog {
+  param([string]$Prefix, [string]$Message)
+  $line = '[heal] ' + $Message + [Environment]::NewLine
+  [IO.File]::AppendAllText((Join-Path $Prefix 'mitm.log'), $line, (New-Object Text.UTF8Encoding($false)))
+}
+
+function Test-AgyStableUpdate {
+  param([string]$Path)
+  $previous = $null
+  for ($attempt = 0; $attempt -lt 15; $attempt++) {
+    try {
+      $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+      if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -lt 10MB) { return $false }
+      $stamp = "$($item.Length):$($item.LastWriteTimeUtc.Ticks)"
+      if ($stamp -ceq $previous) {
+        # Exclusive access also rejects a writer that has not closed the update yet.
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+        try { return $stream.Length -ge 10MB -and $stream.ReadByte() -eq 0x4D -and $stream.ReadByte() -eq 0x5A }
+        finally { $stream.Dispose() }
+      }
+      $previous = $stamp
+    } catch { return $false }
+    Start-Sleep -Seconds 2
+  }
   return $false
 }
-if ($cmd -and $cmd.Source -like "*.exe" -and -not (Test-AgyLauncher $cmd.Source)) {
-  $agyExe = $cmd.Source
-  $shimDir = Split-Path $agyExe
-  $shimPath = Join-Path $shimDir "agy.cmd"
-  $realExe  = Join-Path $shimDir "agy.real.exe"
-  if (Test-Path -LiteralPath $realExe) { Remove-Item -LiteralPath $realExe -Force }
-  Move-Item -LiteralPath $agyExe -Destination $realExe -Force
-  Copy-Item -LiteralPath $shimTpl -Destination $shimPath -Force
-  Save-ShimPath $shimPath
-  Say "shim installed: $shimPath (real binary -> agy.real.exe)"
-} elseif ($cmd -and $cmd.Source -like "*.cmd" -and (Select-String -LiteralPath $cmd.Source -Pattern "agy-region-fixer" -Quiet)) {
-  # already our shim — refresh its contents (port/CA may have changed)
-  Copy-Item -LiteralPath $shimTpl -Destination $cmd.Source -Force
-  $shimPath = $cmd.Source
-  Save-ShimPath $shimPath
-  Say "shim updated: $shimPath"
-} elseif ($cmd) {
-  # found, but not as a plain agy.exe (npm .cmd/.ps1, a WindowsApps alias, a scoop shim): it cannot be
-  # swapped in place, and a wrapper for these is not implemented on Windows yet - say so instead of "not found"
-  Say "agy was found ($($cmd.Source), type $($cmd.CommandType)), but it is not a plain agy.exe, so the shim was NOT installed."
-  Say "The proxy itself works. Run agy through it manually:"
-  $manualCa = $ca.Replace("'", "''")
-  Say "  `$env:SSL_CERT_FILE='$manualCa'; `$env:HTTPS_PROXY='http://127.0.0.1:$PORT'; agy"
-} else {
-  Say "agy not found in PATH — shim not installed. Install Antigravity CLI and re-run the installer."
+
+function Set-AgyNativeFiles {
+  param($Transaction, $State, [string]$Template, $Config, [switch]$ReplaceOriginal)
+  $configPath = Join-Path (Split-Path -Parent $State.shimPath) 'agy-launcher.json'
+  if ($ReplaceOriginal) {
+    $realStage = New-AgyStagedCopy $Transaction $State.shimPath $State.target
+    Set-AgyTransactionFile $Transaction $State.target $realStage
+  }
+  $configStage = New-AgyStagedJson $Transaction $configPath $Config
+  Set-AgyTransactionFile $Transaction $configPath $configStage
+  $sameBinary = (Test-AgyNativeShim $State.shimPath) -and ((Get-FileHash -LiteralPath $State.shimPath -Algorithm SHA256).Hash -ceq (Get-FileHash -LiteralPath $Template -Algorithm SHA256).Hash)
+  if (-not $sameBinary) {
+    $shimStage = New-AgyStagedCopy $Transaction $Template $State.shimPath
+    Set-AgyTransactionFile $Transaction $State.shimPath $shimStage
+  }
 }
+
+function Install-AgyWindowsShim {
+  param(
+    [Parameter(Mandatory = $true)][string]$Prefix,
+    [Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$Port,
+    [Parameter(Mandatory = $true)][string]$Certificate,
+    [Parameter(Mandatory = $true)][string]$SourcePath
+  )
+  $Certificate = Get-AgyFullPath $Certificate
+  if (-not [IO.File]::Exists($Certificate)) { throw "Proxy certificate is missing: $Certificate" }
+  Invoke-AgyShimLock $Prefix {
+    param($root)
+    $savedState = Read-AgyShimState $root
+    $state = $savedState
+    $legacy = $null
+    if (-not $state) { $legacy = Read-AgyLegacyState $root; $state = $legacy }
+    $legacyPath = if ($state -and $state.PSObject.Properties['legacyPath']) { $state.legacyPath } else { $null }
+    if ($legacyPath -and -not (Test-AgyLegacyShim $legacyPath)) { throw "The legacy shim is no longer owned: $legacyPath" }
+    if (-not $state) { $state = Get-AgyCommandTarget $root }
+    $configPath = Join-Path (Split-Path -Parent $state.shimPath) 'agy-launcher.json'
+    if ($savedState) { [void](Assert-AgyOwnedConfig $state) }
+    elseif ([IO.File]::Exists($configPath)) { throw "Refusing to replace a foreign launcher configuration: $configPath" }
+    if (-not $savedState -and -not $legacy -and $state.mode -eq 'inplace' -and [IO.File]::Exists($state.target)) {
+      throw "Refusing to replace an existing original-binary backup: $($state.target)"
+    }
+    if ($state.mode -eq 'overlay') {
+      if (-not [IO.File]::Exists($state.target)) { throw "The managed agy launcher is missing: $($state.target)" }
+      if ([IO.File]::Exists($state.shimPath) -and -not (Test-AgyNativeShim $state.shimPath)) {
+        throw "Refusing to replace a foreign overlay executable: $($state.shimPath)"
+      }
+      $bin = Split-Path -Parent $state.shimPath
+      if (-not [IO.Directory]::Exists($bin)) { [void][IO.Directory]::CreateDirectory($bin) }
+    }
+    $transaction = New-AgyTransaction
+    $oldUserPath = Get-AgyUserPath
+    $oldProcessPath = $env:Path
+    $pathChanged = $false
+    try {
+      # Complete compilation before making any changes to the original CLI.
+      $template = Get-AgyNativeTemplate $root $SourcePath $savedState $transaction
+      $replaceOriginal = $false
+      if ($state.mode -eq 'inplace') {
+        if ([IO.File]::Exists($state.shimPath) -and -not (Test-AgyNativeShim $state.shimPath)) {
+          if (($savedState -or $legacy) -and -not (Test-AgyStableUpdate $state.shimPath)) {
+            throw "The replacement agy.exe is incomplete or suspicious; it was left untouched: $($state.shimPath)"
+          }
+          $replaceOriginal = $true
+        } elseif (-not [IO.File]::Exists($state.target)) { throw "The original agy executable is missing: $($state.target)" }
+        if (Test-AgyNativeShim $state.target) { throw "The saved original is itself a native shim: $($state.target)" }
+      }
+      if ($template.Staged) { Set-AgyTransactionFile $transaction (Join-Path $root 'agy.exe.tpl') $template.Path }
+      $nativeTemplate = Join-Path $root 'agy.exe.tpl'
+      $state | Add-Member -NotePropertyName sourceHash -NotePropertyValue $template.SourceHash -Force
+      if ($state.mode -eq 'overlay') {
+        if (-not (Test-AgyPathContains $oldUserPath $state.pathEntry)) { $state.pathAdded = $true }
+        if (-not (Test-AgyPathContains $oldProcessPath $state.pathEntry)) { $state | Add-Member -NotePropertyName processPathAdded -NotePropertyValue $true -Force }
+      }
+      # Recovery metadata must exist before any original executable or user PATH changes.
+      $statePath = Join-Path $root 'shim-state.json'
+      $stateStage = New-AgyStagedJson $transaction $statePath $state
+      Set-AgyTransactionFile $transaction $statePath $stateStage
+      if ($state.mode -eq 'overlay') { $pathChanged = $true; Add-AgyOverlayPath $state }
+      $config = [ordered]@{ version = 1; target = $state.target; kind = $state.kind; port = $Port; certificate = $Certificate }
+      Set-AgyNativeFiles $transaction $state $nativeTemplate $config -ReplaceOriginal:$replaceOriginal
+      if ($legacyPath) {
+        Remove-AgyTransactionFile $transaction $legacyPath
+        Remove-AgyTransactionFile $transaction (Join-Path $root 'shim.path')
+        $state.PSObject.Properties.Remove('legacyPath')
+        $stateStage = New-AgyStagedJson $transaction $statePath $state
+        Set-AgyTransactionFile $transaction $statePath $stateStage
+      }
+      Complete-AgyTransaction $transaction
+    } catch {
+      Undo-AgyFailedOperation $transaction $_ $pathChanged $oldUserPath $oldProcessPath
+    } finally { Clear-AgyTransactionTemps $transaction }
+    if ($pathChanged) { Send-AgyEnvironmentChange }
+    return $state
+  }
+}
+
+function Repair-AgyWindowsShim {
+  param([Parameter(Mandatory = $true)][string]$Prefix)
+  Invoke-AgyShimLock $Prefix {
+    param($root)
+    $state = Read-AgyShimState $root
+    if (-not $state) { return }
+    $template = Join-Path $root 'agy.exe.tpl'
+    if (-not (Test-AgyNativeShim $template)) { throw "The native launcher template is missing or invalid: $template" }
+    $configPath = Assert-AgyOwnedConfig $state
+    if (-not [IO.File]::Exists($configPath)) { throw "Launcher configuration is missing; run the installer again: $configPath" }
+    $config = Read-AgyLauncherConfig $configPath
+    if (Test-AgyNativeShim $state.shimPath) { return }
+    $replaceOriginal = $false
+    if ($state.mode -eq 'overlay') {
+      if ([IO.File]::Exists($state.shimPath)) {
+        Write-AgyHealLog $root "foreign overlay executable left untouched: $($state.shimPath)"
+        return
+      }
+      if (-not [IO.File]::Exists($state.target)) {
+        Write-AgyHealLog $root "managed launcher is missing; wrapper left untouched: $($state.target)"
+        return
+      }
+    } else {
+      if (-not [IO.File]::Exists($state.target) -or (Test-AgyNativeShim $state.target)) { throw "The saved original executable is missing or invalid: $($state.target)" }
+      if ([IO.File]::Exists($state.shimPath)) {
+        if (-not (Test-AgyStableUpdate $state.shimPath)) {
+          Write-AgyHealLog $root "suspicious or unstable agy.exe (not MZ or <10MB) left untouched: $($state.shimPath)"
+          return
+        }
+        $replaceOriginal = $true
+      }
+    }
+    $transaction = New-AgyTransaction
+    try {
+      Set-AgyNativeFiles $transaction $state $template $config -ReplaceOriginal:$replaceOriginal
+      Complete-AgyTransaction $transaction
+    } catch { $failure = $_; Undo-AgyTransaction $transaction; throw $failure }
+    finally { Clear-AgyTransactionTemps $transaction }
+    Write-AgyHealLog $root "restored native launcher: $($state.shimPath)"
+  }
+}
+
+function Remove-AgyWindowsShim {
+  param([Parameter(Mandatory = $true)][string]$Prefix)
+  Invoke-AgyShimLock $Prefix {
+    param($root)
+    $state = Read-AgyShimState $root
+    if (-not $state) {
+      $legacy = Read-AgyLegacyState $root
+      if (-not $legacy) { return }
+      $state = $legacy
+    }
+    $configPath = Assert-AgyOwnedConfig $state
+    $transaction = New-AgyTransaction
+    $oldUserPath = Get-AgyUserPath
+    $oldProcessPath = $env:Path
+    $pathChanged = $false
+    try {
+      $ownedShim = Test-AgyNativeShim $state.shimPath
+      if ($state.mode -eq 'overlay' -and [IO.File]::Exists($state.shimPath) -and -not $ownedShim) {
+        throw "A foreign executable is present in the private overlay directory; uninstall was stopped to preserve it: $($state.shimPath)"
+      }
+      if ($state.mode -eq 'inplace') {
+        if ($ownedShim -or -not [IO.File]::Exists($state.shimPath)) {
+          if (-not [IO.File]::Exists($state.target) -or (Test-AgyNativeShim $state.target)) { throw "Cannot restore the original agy executable: $($state.target)" }
+          $restore = New-AgyStagedCopy $transaction $state.target $state.shimPath
+          Set-AgyTransactionFile $transaction $state.shimPath $restore
+          Remove-AgyTransactionFile $transaction $state.target
+        }
+        # A foreign replacement or a newly arrived update remains in place.
+        # Its existing agy.real.exe is also kept, outside the private prefix.
+      } elseif ($ownedShim) { Remove-AgyTransactionFile $transaction $state.shimPath }
+      Remove-AgyTransactionFile $transaction $configPath
+      if ($state.PSObject.Properties['legacyPath'] -and $state.legacyPath) { Remove-AgyTransactionFile $transaction $state.legacyPath }
+      if ($state.mode -eq 'overlay') {
+        $entry = Join-Path $root 'bin'
+        $pathChanged = $true
+        if ($state.pathAdded) { Set-AgyUserPath -Value (Get-AgyPathWithoutEntry $oldUserPath $entry) }
+        if ($state.pathAdded -or $state.processPathAdded) { $env:Path = Get-AgyPathWithoutEntry $oldProcessPath $entry }
+      }
+      Remove-AgyTransactionFile $transaction (Join-Path $root 'shim-state.json')
+      Remove-AgyTransactionFile $transaction (Join-Path $root 'shim.path')
+      Complete-AgyTransaction $transaction
+    } catch {
+      Undo-AgyFailedOperation $transaction $_ $pathChanged $oldUserPath $oldProcessPath
+    } finally { Clear-AgyTransactionTemps $transaction }
+    if ($pathChanged) { Send-AgyEnvironmentChange }
+  }
+}
+'@
+$windowsLauncherSource = @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Reflection;
+using System.Text;
+using System.Web.Script.Serialization;
+
+[assembly: AssemblyDescription("agy-region-fixer-native-shim-v1")]
+[assembly: AssemblyTitle("agy-region-fixer-native-shim-v1")]
+[assembly: AssemblyVersion("1.0.0.0")]
+
+internal static class Launcher
+{
+    private const string Marker = "agy-region-fixer-native-shim-v1";
+    private const int ConfigurationLimit = 65536;
+    private const int WindowsCommandLineLimit = 32766;
+    private const int CmdCommandLineLimit = 8190;
+    private const int ProbeTimeoutMilliseconds = 1000;
+    private const int CannotExecute = 126;
+    private const int CommandNotFound = 127;
+
+    private sealed class Configuration
+    {
+        internal string Target;
+        internal string Kind;
+        internal string Certificate;
+        internal int Port;
+    }
+
+    private sealed class LauncherException : Exception
+    {
+        internal readonly int ExitCode;
+
+        internal LauncherException(string message, int exitCode)
+            : base(message)
+        {
+            ExitCode = exitCode;
+        }
+    }
+
+    private static int Main(string[] arguments)
+    {
+        // The child shares this console and receives the same Ctrl+C/Ctrl+Break.
+        // Keep waiting for it rather than leaving an interactive child behind.
+        ConsoleCancelEventHandler cancelHandler = delegate(object sender, ConsoleCancelEventArgs e)
+        {
+            e.Cancel = true;
+        };
+        Console.CancelKeyPress += cancelHandler;
+        try
+        {
+            string ownPath = Path.GetFullPath(Assembly.GetExecutingAssembly().Location);
+            Configuration configuration = ReadConfiguration(ownPath);
+            ProcessStartInfo start = CreateStartInfo(configuration, arguments);
+            if (IsProxyAlive(configuration.Port))
+            {
+                start.EnvironmentVariables["SSL_CERT_FILE"] = configuration.Certificate;
+                start.EnvironmentVariables["HTTPS_PROXY"] =
+                    "http://127.0.0.1:" + configuration.Port.ToString(CultureInfo.InvariantCulture);
+            }
+
+            using (Process child = Process.Start(start))
+            {
+                if (child == null)
+                    throw new LauncherException("could not start the configured target", CannotExecute);
+                child.WaitForExit();
+                return child.ExitCode;
+            }
+        }
+        catch (LauncherException e)
+        {
+            Console.Error.WriteLine("agy: " + e.Message);
+            return e.ExitCode;
+        }
+        catch (Win32Exception e)
+        {
+            Console.Error.WriteLine("agy: could not start the configured target (Windows error " +
+                e.NativeErrorCode.ToString(CultureInfo.InvariantCulture) + ")");
+            return e.NativeErrorCode == 2 || e.NativeErrorCode == 3 ? CommandNotFound : CannotExecute;
+        }
+        catch (Exception e)
+        {
+            if (!(e is IOException) && !(e is UnauthorizedAccessException) &&
+                !(e is ArgumentException) && !(e is InvalidOperationException) &&
+                !(e is NotSupportedException) && !(e is System.Security.SecurityException))
+                throw;
+            Console.Error.WriteLine("agy: could not read configuration or launch the configured target");
+            return CannotExecute;
+        }
+        finally
+        {
+            Console.CancelKeyPress -= cancelHandler;
+        }
+    }
+
+    private static Configuration ReadConfiguration(string ownPath)
+    {
+        string configPath = Path.Combine(Path.GetDirectoryName(ownPath), "agy-launcher.json");
+        if (!File.Exists(configPath))
+            throw new LauncherException("agy-launcher.json is missing; reinstall the launcher", CannotExecute);
+
+        string text;
+        using (FileStream stream = File.OpenRead(configPath))
+        {
+            byte[] bytes = new byte[ConfigurationLimit + 1];
+            int count = 0;
+            int read;
+            while (count < bytes.Length &&
+                (read = stream.Read(bytes, count, bytes.Length - count)) != 0)
+                count += read;
+            if (count > ConfigurationLimit)
+                throw InvalidConfiguration();
+            int offset = count >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf ? 3 : 0;
+            try
+            {
+                text = new UTF8Encoding(false, true).GetString(bytes, offset, count - offset);
+            }
+            catch (DecoderFallbackException)
+            {
+                throw InvalidConfiguration();
+            }
+        }
+
+        Dictionary<string, object> values;
+        try
+        {
+            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            serializer.MaxJsonLength = ConfigurationLimit;
+            serializer.RecursionLimit = 4;
+            values = serializer.DeserializeObject(text) as Dictionary<string, object>;
+        }
+        catch (ArgumentException)
+        {
+            throw InvalidConfiguration();
+        }
+        catch (InvalidOperationException)
+        {
+            throw InvalidConfiguration();
+        }
+        catch (FormatException)
+        {
+            throw InvalidConfiguration();
+        }
+        catch (OverflowException)
+        {
+            throw InvalidConfiguration();
+        }
+
+        object version;
+        object port;
+        object target;
+        object kind;
+        object certificate;
+        if (values == null || values.Count != 5 ||
+            !values.TryGetValue("version", out version) || !(version is int) || (int)version != 1 ||
+            !values.TryGetValue("port", out port) || !(port is int) || (int)port < 1 || (int)port > 65535 ||
+            !values.TryGetValue("target", out target) || !(target is string) ||
+            !values.TryGetValue("kind", out kind) || !(kind is string) ||
+            !values.TryGetValue("certificate", out certificate) || !(certificate is string))
+            throw InvalidConfiguration();
+
+        string targetPath = AbsolutePath((string)target);
+        string certificatePath = AbsolutePath((string)certificate);
+        string targetKind = (string)kind;
+        if (targetKind != "exe" && targetKind != "cmd" && targetKind != "ps1")
+            throw InvalidConfiguration();
+        if (!String.Equals(Path.GetExtension(targetPath), "." + targetKind, StringComparison.OrdinalIgnoreCase))
+            throw InvalidConfiguration();
+        if (String.Equals(targetPath, ownPath, StringComparison.OrdinalIgnoreCase))
+            throw new LauncherException("the configured target points to the launcher itself", CannotExecute);
+        if (!File.Exists(targetPath))
+            throw new LauncherException("the configured target is missing; reinstall the CLI or launcher", CommandNotFound);
+        if (targetKind == "exe" && IsNativeLauncher(targetPath))
+            throw new LauncherException("the configured target is another region-fixer launcher", CannotExecute);
+
+        return new Configuration
+        {
+            Target = targetPath,
+            Kind = targetKind,
+            Certificate = certificatePath,
+            Port = (int)port
+        };
+    }
+
+    private static LauncherException InvalidConfiguration()
+    {
+        return new LauncherException("agy-launcher.json is invalid; reinstall the launcher", CannotExecute);
+    }
+
+    private static string AbsolutePath(string value)
+    {
+        bool drivePath = value.Length >= 3 &&
+            ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) &&
+            value[1] == ':' && (value[2] == '\\' || value[2] == '/');
+        bool uncPath = value.StartsWith(@"\\", StringComparison.Ordinal) &&
+            !value.StartsWith(@"\\.\", StringComparison.Ordinal) &&
+            !value.StartsWith(@"\\?\", StringComparison.Ordinal);
+        if ((!drivePath && !uncPath) || value.IndexOf('\0') >= 0)
+            throw InvalidConfiguration();
+        try
+        {
+            string fullPath = Path.GetFullPath(value);
+            if (uncPath)
+            {
+                string[] components = fullPath.Substring(2).Split('\\');
+                if (components.Length < 3 || components[0].Length == 0 || components[1].Length == 0)
+                    throw InvalidConfiguration();
+            }
+            return fullPath;
+        }
+        catch (ArgumentException) { throw InvalidConfiguration(); }
+        catch (NotSupportedException) { throw InvalidConfiguration(); }
+        catch (PathTooLongException) { throw InvalidConfiguration(); }
+    }
+
+    private static bool IsNativeLauncher(string path)
+    {
+        try
+        {
+            return String.Equals(FileVersionInfo.GetVersionInfo(path).FileDescription,
+                Marker, StringComparison.Ordinal);
+        }
+        catch (Win32Exception)
+        {
+            // App execution aliases may not expose version resources.
+            return false;
+        }
+    }
+
+    private static ProcessStartInfo CreateStartInfo(Configuration configuration, string[] arguments)
+    {
+        ProcessStartInfo start = new ProcessStartInfo();
+        start.UseShellExecute = false;
+        start.CreateNoWindow = false;
+        start.WorkingDirectory = Environment.CurrentDirectory;
+        if (configuration.Kind == "exe")
+        {
+            start.FileName = configuration.Target;
+            start.Arguments = QuoteArguments(arguments);
+        }
+        else if (configuration.Kind == "cmd")
+        {
+            start.FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe");
+            string prefix = "AGY_" + Guid.NewGuid().ToString("N") + "_";
+            string quotedArguments = QuoteArguments(arguments);
+            if ((long)configuration.Target.Length + quotedArguments.Length + 3 > CmdCommandLineLimit)
+                throw new LauncherException("arguments exceed the cmd.exe command-line limit", CannotExecute);
+            start.EnvironmentVariables[prefix + "TARGET"] = configuration.Target;
+            start.EnvironmentVariables[prefix + "ARGUMENTS"] = quotedArguments;
+            // Delayed expansion injects values after cmd's operators and percent
+            // expressions have been parsed. Never insert user text into this code.
+            start.Arguments = "/d /v:on /s /c \"\"!" + prefix + "TARGET!\" !" + prefix + "ARGUMENTS!\"";
+        }
+        else
+        {
+            start.FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),
+                @"WindowsPowerShell\v1.0\powershell.exe");
+            string targetLiteral = Convert.ToBase64String(Encoding.Unicode.GetBytes(configuration.Target));
+            string json = new JavaScriptSerializer().Serialize(arguments);
+            string argumentsLiteral = Convert.ToBase64String(Encoding.Unicode.GetBytes(json));
+            string script = "$target=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('" +
+                targetLiteral + "'));$arguments=@(ConvertFrom-Json -InputObject " +
+                "([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('" + argumentsLiteral +
+                "'))));& $target @arguments;$succeeded=$?;" +
+                "if($null -ne $LASTEXITCODE){exit $LASTEXITCODE};if($succeeded){exit 0}else{exit 1}";
+            start.Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " +
+                Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+        }
+
+        if ((long)start.FileName.Length + start.Arguments.Length + 3 > WindowsCommandLineLimit)
+            throw new LauncherException("arguments exceed the Windows command-line limit", CannotExecute);
+        return start;
+    }
+
+    private static string QuoteArguments(string[] arguments)
+    {
+        StringBuilder result = new StringBuilder();
+        foreach (string argument in arguments)
+        {
+            if (result.Length != 0)
+                result.Append(' ');
+            result.Append(QuoteArgument(argument));
+        }
+        return result.ToString();
+    }
+
+    private static string QuoteArgument(string argument)
+    {
+        StringBuilder result = new StringBuilder();
+        result.Append('"');
+        int backslashes = 0;
+        foreach (char character in argument)
+        {
+            if (character == '\\')
+            {
+                backslashes++;
+                continue;
+            }
+            if (character == '"')
+                result.Append('\\', backslashes * 2 + 1);
+            else
+                result.Append('\\', backslashes);
+            result.Append(character);
+            backslashes = 0;
+        }
+        result.Append('\\', backslashes * 2);
+        result.Append('"');
+        return result.ToString();
+    }
+
+    private static bool IsProxyAlive(int port)
+    {
+        using (TcpClient client = new TcpClient(AddressFamily.InterNetwork))
+        {
+            try
+            {
+                IAsyncResult pending = client.BeginConnect(IPAddress.Loopback, port, null, null);
+                using (System.Threading.WaitHandle completed = pending.AsyncWaitHandle)
+                {
+                    if (!completed.WaitOne(ProbeTimeoutMilliseconds))
+                        return false;
+                    client.EndConnect(pending);
+                    return true;
+                }
+            }
+            catch (SocketException) { return false; }
+        }
+    }
+}
+'@
+
+# --- shim ------------------------------------------------------------------
+Say "4/6 Native EXE shim for agy (automatic format detection)"
+$supportPath = Join-Path $PREFIX "windows-support.ps1"
+$launcherSourcePath = Join-Path $PREFIX "windows-launcher.cs"
+WriteBom $supportPath $windowsSupportSource
+WriteNoBom $launcherSourcePath $windowsLauncherSource
+. $supportPath
+$shimState = Install-AgyWindowsShim -Prefix $PREFIX -Port $PORT -Certificate $ca -SourcePath $launcherSourcePath
+if ($shimState) { Say "native shim installed: $($shimState.shimPath) -> $($shimState.target)" }
 
 # --- heal ------------------------------------------------------------------
 Say "5/6 Shim self-healing (task every 5 minutes)"
 $healPs1 = @'
-$ErrorActionPreference = "Continue"
+$ErrorActionPreference = "Stop"
 $PREFIX = '@PREFIX@'
-$log          = Join-Path $PREFIX "mitm.log"
-$shimPathFile = Join-Path $PREFIX "shim.path"
-$shimTpl      = Join-Path $PREFIX "agy.cmd.tpl"
-function Write-HealLog($message) { Add-Content -LiteralPath $log -Value $message -Encoding UTF8 }
-function Restore-Shim($path) { Copy-Item -LiteralPath $shimTpl -Destination $path -Force }
-if ((Test-Path -LiteralPath $shimPathFile) -and (Test-Path -LiteralPath $shimTpl)) {
-  $shimPath = (Get-Content -LiteralPath $shimPathFile -Encoding UTF8 -First 1).Trim()
-  $shimDir  = Split-Path $shimPath
-  $realExe  = Join-Path $shimDir "agy.real.exe"
-  $agyExe   = Join-Path $shimDir "agy.exe"
-  if (-not (Test-Path -LiteralPath $shimPath) -or -not (Select-String -LiteralPath $shimPath -Pattern "agy-region-fixer" -Quiet)) {
-    Restore-Shim $shimPath
-    Write-HealLog "[heal] restored $shimPath"
-  }
-  # a CLI update brought agy.exe back -> hide it again and restore agy.cmd
-  if ((Test-Path -LiteralPath $agyExe) -and (Test-Path -LiteralPath $realExe)) {
-    # wait for the size to stabilize (cap ~30 s): a mv in the middle of a write leaves a broken agy.real.exe.
-    # not stabilized — bail out, the task will retry in 5 minutes.
-    $prev = -1L; $len = -1L; $stable = $false
-    for ($i=0; $i -lt 15; $i++) {
-      try { $len = (Get-Item -LiteralPath $agyExe -Force).Length } catch { break }
-      if ($len -eq $prev) { $stable = $true; break }
-      $prev = $len; Start-Sleep 2
-    }
-    if (-not $stable) {
-      Write-HealLog "[heal] agy.exe is still being written (size=$len) - left as is"
-    } else {
-      # validation: a real binary starts with MZ and is >= 10 MB; an incomplete update is left alone
-      $looksReal = $false
-      try {
-        $fs = [IO.File]::OpenRead($agyExe)
-        try {
-          $m = New-Object byte[] 2
-          [void]$fs.Read($m, 0, 2)
-          $looksReal = ($m[0] -eq 0x4D -and $m[1] -eq 0x5A) -and ($fs.Length -ge 10MB)
-        } finally { $fs.Close() }
-      } catch { $looksReal = $false }
-      if ($looksReal) {
-        Remove-Item -LiteralPath $realExe -Force
-        Move-Item -LiteralPath $agyExe -Destination $realExe -Force
-        Restore-Shim $shimPath
-        Write-HealLog "[heal] restored after CLI update $shimPath"
-      } else {
-        Write-HealLog "[heal] suspicious agy.exe (not MZ or <10MB) - left as is"
-      }
-    }
-  }
+try {
+  . (Join-Path $PREFIX "windows-support.ps1")
+  Repair-AgyWindowsShim -Prefix $PREFIX
+} catch {
+  Add-Content -LiteralPath (Join-Path $PREFIX "mitm.log") -Value "[heal] $_" -Encoding UTF8
+  exit 1
 }
 '@
 $healPs1 = $healPs1.Replace("@PREFIX@", $PREFIX.Replace("'", "''"))
@@ -381,18 +1173,20 @@ Get-CimInstance Win32_Process -Filter "Name='mitmdump.exe'" -OperationTimeoutSec
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     Wait-Process -Id $_.ProcessId -Timeout 5 -ErrorAction SilentlyContinue
   }
-$shimPathFile = Join-Path $PREFIX "shim.path"
-if (Test-Path -LiteralPath $shimPathFile) {
-  $shimPath = (Get-Content -LiteralPath $shimPathFile -Encoding UTF8 -First 1).Trim()
-  $shimDir  = Split-Path $shimPath
-  $realExe  = Join-Path $shimDir "agy.real.exe"
-  if (Test-Path -LiteralPath $realExe) {
-    Move-Item -LiteralPath $realExe -Destination (Join-Path $shimDir "agy.exe") -Force
-    Write-Host "restored: agy.exe"
-  }
-  Remove-Item -LiteralPath $shimPath -Force -ErrorAction SilentlyContinue
+try {
+  . (Join-Path $PREFIX "windows-support.ps1")
+  Remove-AgyWindowsShim -Prefix $PREFIX
+} catch {
+  Write-Error "Could not restore agy; installation files were preserved: $_"
+  exit 1
 }
-Remove-Item -Recurse -Force -LiteralPath $PREFIX -ErrorAction SilentlyContinue
+try {
+  Remove-Item -Recurse -Force -LiteralPath $PREFIX -ErrorAction Stop
+  if (Test-Path -LiteralPath $PREFIX) { throw "The installation directory still exists." }
+} catch {
+  Write-Error "Removal is incomplete; remaining files are in ${PREFIX}: $_"
+  exit 1
+}
 Write-Host "Fully removed."
 '@
 $unPs1 = $unPs1.Replace("@PREFIX@", $PREFIX.Replace("'", "''"))
@@ -400,7 +1194,7 @@ WriteBom (Join-Path $PREFIX "uninstall.ps1") $unPs1
 
 # --- smoke -----------------------------------------------------------------
 # hard 120 s limit: the process is started separately and the whole tree is killed on timeout
-# (agy.cmd -> cmd.exe -> agy.real.exe); otherwise a hung request or a wait for login
+# (native shim -> original CLI or launcher); otherwise a hung request or a wait for login
 # would block the install forever
 $SMOKE_TIMEOUT_MS = 120000
 function Test-SmokeSuccess($exitCode, $lines) {

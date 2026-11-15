@@ -91,6 +91,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://raw.git
 - 📦 **Any way of installing `agy`** — the installer finds it the way your own shell does (`sudo` hides `~/.local/bin`, `/snap/bin`, nvm, bun, cargo…):
   - a plain binary, an npm/brew/cargo link, a root-owned `/usr/local/bin/agy` → the binary is moved to `agy.real` and replaced by the shim;
   - **snap, Nix** (a launcher that must not be touched) → the launcher stays as is, and a wrapper is placed earlier in your `PATH` (`~/.local/bin`). For a snap the CA certificate is copied into `~/snap/<name>/common/agy-region-fixer`, where the confined app can read it.
+- 🪟 **One Windows installer for all supported formats:** `install.ps1` detects a plain EXE, npm `.cmd`/`.ps1`, a WindowsApps alias or a Scoop shim. It builds a real `agy.exe` wrapper using the .NET Framework compiler included with Windows. Plain binaries are saved as `agy.real.exe`; managed launchers keep their names and files, with the wrapper in `%USERPROFILE%\.agy-region-fixer\bin`. Old `agy.cmd` installations are migrated automatically.
 - 🐧 Linux: systemd plus `runuser` or `setpriv` (both ship in `util-linux`)
 
 ## ⚙️ How it works
@@ -190,8 +191,7 @@ If the proxy is listening but the warning remains, check that `addon.py` still e
 
 ## ⚠️ Limitations
 
-- 🪟 Windows: only a plain `agy.exe` in `PATH` gets the shim. An npm `.cmd`, a WindowsApps alias or a scoop shim is detected and reported, with the command to run `agy` through the proxy by hand.
-- 🪟 Windows: the shim is `agy.cmd`. Consumers that call `agy.exe` strictly via CreateProcess (bypassing `PATHEXT` resolution) will not see it. The CLI and PowerShell work.
+- 🪟 For launcher-based Windows installations, open a new terminal after installation to pick up the updated user `PATH`. Programs must resolve the installed `agy.exe` wrapper or launch its full path; an absolute call to the original managed launcher bypasses it. A system `PATH` entry can take precedence over the user `PATH`; check which `agy` your application resolves.
 - 🧬 If Google changes the response format (renames the field or moves to binary proto) the addon stops cleaning; fixed with a one-line change in `addon.py`.
 - 📌 If `agy` starts certificate pinning (Go clients almost never do) this approach would need rework.
 

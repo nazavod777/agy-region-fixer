@@ -5,7 +5,7 @@ $parseErrors = $null
 $installerAst = [Management.Automation.Language.Parser]::ParseFile($installerPath, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors) { throw ($parseErrors -join "`n") }
 $source = [IO.File]::ReadAllText($installerPath)
-$helperNames = @("ConvertTo-ProxyPort", "Test-PortBindable", "Select-ProxyPort", "WriteNoBom", "WriteBom", "Get-ShimContent", "Stop-OurProxy")
+$helperNames = @("ConvertTo-ProxyPort", "Test-PortBindable", "Select-ProxyPort", "WriteNoBom", "WriteBom", "Stop-OurProxy")
 foreach ($name in $helperNames) {
   $definition = $installerAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
   if (@($definition).Count -ne 1) { throw "Expected exactly one $name helper" }
@@ -36,8 +36,6 @@ try {
   Assert-True (Test-PortBindable $autoPort) "Automatic port is not bindable after its probe"
   WriteNoBom $savedPath ("$autoPort`r`n")
   Assert-True ((Select-ProxyPort $null $savedPath) -eq $autoPort) "Free saved high port was not reused"
-  $shim = Get-ShimContent $autoPort "synthetic-ca.pem"
-  Assert-True ($shim.Contains("HTTPS_PROXY=http://127.0.0.1:$autoPort")) "Shim did not use the selected port"
   Assert-True (([IO.File]::ReadAllText($savedPath)).Trim() -ceq "$autoPort") "Selected port was not persisted"
 
   $busyListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $autoPort)
@@ -152,6 +150,9 @@ try {
     $script:stoppedIds = @()
     $script:waitedIds = @()
     $script:removedPaths = @()
+    $script:removedShimPrefixes = @()
+    [IO.Directory]::CreateDirectory($expectedPrefix) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $expectedPrefix "windows-support.ps1"), 'function Remove-AgyWindowsShim { param($Prefix) $script:removedShimPrefixes += $Prefix }')
     function Remove-ItemProperty {}
     function schtasks {}
     function Get-CimInstance {
@@ -170,6 +171,7 @@ try {
     . ([scriptblock]::Create($uninstall))
     Assert-True ($script:stoppedIds.Count -eq 1 -and $script:stoppedIds[0] -eq 34567) "Uninstall stopped another installation"
     Assert-True ($script:waitedIds.Count -eq 1 -and $script:waitedIds[0] -eq 34567) "Uninstall did not wait for its own process"
+    Assert-True ($script:removedShimPrefixes.Count -eq 1 -and $script:removedShimPrefixes[0] -eq $expectedPrefix) "Uninstall did not restore its own native shim"
     Assert-True ($script:removedPaths.Count -eq 1 -and $script:removedPaths[0] -eq $expectedPrefix) "Uninstall selected another installation directory"
   }
 

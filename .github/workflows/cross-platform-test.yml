@@ -90,6 +90,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Addon regression tests failed" }
           & powershell -NoProfile -NonInteractive -File tests/test_windows_config.ps1
           if ($LASTEXITCODE -ne 0) { throw "Windows port selection tests failed" }
+          & powershell -NoProfile -NonInteractive -File tests/test_windows_launchers.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Windows native launcher tests failed" }
 
       - name: Verify proxy is listening and CA exists (unix)
         if: runner.os != 'Windows'
@@ -183,22 +185,25 @@ jobs:
         shell: pwsh
         run: |
           $PREFIX = "$env:USERPROFILE\.agy-region-fixer"
-          $shim = "$env:USERPROFILE\agy-fake-bin\agy.cmd"
-          if (-not (Test-Path $shim)) { throw "shim agy.cmd was not created" }
-          if (-not (Select-String -Path $shim -Pattern "agy-region-fixer" -Quiet)) { throw "agy.cmd is not ours" }
+          $shim = "$env:USERPROFILE\agy-fake-bin\agy.exe"
+          . "$PREFIX\windows-support.ps1"
+          if (-not (Test-AgyNativeShim -Path $shim)) { throw "native agy.exe shim was not created" }
           if (-not (Test-Path "$env:USERPROFILE\agy-fake-bin\agy.real.exe")) { throw "agy.real.exe missing" }
           $run = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue
           if (-not $run."agy-region-fixer") { throw "HKCU Run entry was not created" }
           # simulate a CLI update: put agy.exe back on top
           Copy-Item "$env:USERPROFILE\agy-fake-bin\agy.real.exe" "$env:USERPROFILE\agy-fake-bin\agy.exe" -Force
           powershell -File "$PREFIX\heal.ps1"
-          if (Test-Path "$env:USERPROFILE\agy-fake-bin\agy.exe") { throw "heal did not hide agy.exe" }
-          if (-not (Select-String -Path $shim -Pattern "agy-region-fixer" -Quiet)) { throw "heal did not restore agy.cmd" }
+          if (-not (Test-AgyNativeShim -Path $shim)) { throw "heal did not restore native agy.exe" }
           # negative check: small junk as agy.exe — heal must not hide it
           Set-Content "$env:USERPROFILE\agy-fake-bin\agy.exe" "junk"
           powershell -File "$PREFIX\heal.ps1"
           if (-not (Test-Path "$env:USERPROFILE\agy-fake-bin\agy.exe")) { throw "heal ate a small file" }
           if (-not (Test-Path "$env:USERPROFILE\agy-fake-bin\agy.real.exe")) { throw "heal touched agy.real.exe" }
+          # Restore a valid CLI before uninstall so the junk fixture cannot mask restoration.
+          Copy-Item "$env:USERPROFILE\agy-fake-bin\agy.real.exe" $shim -Force
+          powershell -File "$PREFIX\heal.ps1"
+          if (-not (Test-AgyNativeShim -Path $shim)) { throw "heal did not restore working state" }
           echo "SHIM+HEAL+RUN OK"
 
       - name: Uninstall and verify clean state (unix)
