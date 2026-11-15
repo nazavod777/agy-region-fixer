@@ -267,9 +267,11 @@ for ($i=0; $i -lt 40; $i++) {
 if (-not $ok) { Die "CA was not generated — log: $PREFIX\mitm-stdout.log" }
 
 # MITM check
+# The local CA has no online revocation service. Schannel still verifies the
+# certificate chain; only unavailable revocation distribution points are ignored.
 $mitmOk = $false
 for ($i=0; $i -lt 20; $i++) {
-  curl.exe -s --max-time 5 --cacert $ca -x "http://127.0.0.1:$PORT" -o NUL https://www.google.com/
+  curl.exe -s --ssl-revoke-best-effort --max-time 5 --cacert $ca -x "http://127.0.0.1:$PORT" -o NUL https://www.google.com/
   if ($LASTEXITCODE -eq 0) { $mitmOk = $true; break }
   Start-Sleep 1
 }

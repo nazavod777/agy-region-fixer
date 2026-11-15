@@ -163,22 +163,22 @@ try {
   $watcherType.GetField('prefix', $flags).SetValue($null, $prefix)
   $plan = $watcherType.GetField('desired', $flags).GetValue($null)
   $configure = $watcherType.GetMethod('ConfigureSubscriptions', $flags)
-  [void]$configure.Invoke($null, @($shim))
+  [void]$configure.Invoke($null, [string[]]@($shim))
   Assert-True ($plan.ContainsKey($cliParent) -and $plan[$cliParent]) 'Application anchor was not recursive'
   Assert-True (-not $plan.ContainsKey($cli)) 'Subscription layout still held a descendant directory handle'
   Assert-True ($plan.ContainsKey($prefix) -and -not $plan[$prefix]) 'State metadata expanded to a recursive profile watch'
   Assert-Equal @($plan.GetEnumerator() | Where-Object { $_.Value }).Count 1 'Unexpected recursive watch outside application subtree'
   $plan.Clear()
   $overlayShim = Join-Path $prefix 'bin\agy.exe'
-  [void]$configure.Invoke($null, @($overlayShim))
+  [void]$configure.Invoke($null, [string[]]@($overlayShim))
   Assert-True ($plan[$prefix]) 'Overlay prefix was not a recursive owned anchor'
   Assert-True (-not $plan.ContainsKey((Join-Path $prefix 'bin'))) 'Overlay configuration recreated a descendant handle'
   Assert-True (-not $plan.ContainsKey($cli)) 'Overlay watch retained a handle on the external managed launcher directory'
   $plan.Clear()
   $driveRoot = [IO.Path]::GetPathRoot($shim)
-  $normalizedRoot = $watcherType.GetMethod('FullPath', $flags).Invoke($null, @($driveRoot))
+  $normalizedRoot = $watcherType.GetMethod('FullPath', $flags).Invoke($null, [string[]]@($driveRoot))
   Assert-Equal $normalizedRoot $driveRoot 'Drive root became a drive-relative current directory'
-  [void]$configure.Invoke($null, @((Join-Path $driveRoot 'agy.exe')))
+  [void]$configure.Invoke($null, [string[]]@((Join-Path $driveRoot 'agy.exe')))
   Assert-True ($plan.ContainsKey($driveRoot) -and -not $plan[$driveRoot]) 'Shallow root path lost its nonrecursive root watch'
   Assert-Equal @($plan.GetEnumerator() | Where-Object { $_.Value }).Count 0 'Shallow path created a broad recursive watch'
   $plan.Clear()

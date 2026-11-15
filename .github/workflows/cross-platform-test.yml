@@ -89,21 +89,31 @@ jobs:
         env:
           AGY_BYPASS_PORT: "8090"
 
-      - name: Record Windows proxy startup diagnostics
-        if: runner.os == 'Windows' && always()
+      - name: Verify Windows HTTPS proxy and certificate trust
+        if: runner.os == 'Windows'
         shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
           $prefix = "$env:USERPROFILE\.agy-region-fixer"
           $ca = Join-Path $prefix 'ca\mitmproxy-ca-cert.pem'
-          if (Test-Path -LiteralPath $ca) {
-            & curl.exe -sS --max-time 15 --cacert $ca -x http://127.0.0.1:8090 -o NUL https://www.google.com/
-            Write-Host "Diagnostic HTTPS proxy exit code: $LASTEXITCODE"
-          }
+          if (-not (Test-Path -LiteralPath $ca)) { throw 'The proxy CA is missing' }
+          & curl.exe -sS --ssl-revoke-best-effort --max-time 15 --cacert $ca -x http://127.0.0.1:8090 -o NUL https://www.google.com/
+          $proxyExit = $LASTEXITCODE
           $log = Join-Path $prefix 'mitm-stdout.log'
           if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Tail 60 }
-          # External connectivity is diagnostic here; local proxy behavior has
-          # separate acceptance tests below.
+          if ($proxyExit -ne 0) { throw "HTTPS proxy verification failed with exit $proxyExit" }
+          # A different, valid CA must still be rejected. Best-effort revocation
+          # must not turn into disabled certificate-chain verification.
+          $untrusted = Join-Path ([IO.Path]::GetTempPath()) ('agy-untrusted-ca-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $untrusted -ErrorAction Stop | Out-Null
+          try {
+            & "$prefix\venv\Scripts\python.exe" -I -c 'import sys;from mitmproxy.certs import CertStore;CertStore.from_store(sys.argv[1],sys.argv[2],2048)' $untrusted alternate
+            if ($LASTEXITCODE -ne 0) { throw 'The unrelated CA fixture could not be generated' }
+            $wrongCa = Join-Path $untrusted 'alternate-ca-cert.pem'
+            & curl.exe -sS --ssl-revoke-best-effort --max-time 15 --cacert $wrongCa -x http://127.0.0.1:8090 -o NUL https://www.google.com/
+            if ($LASTEXITCODE -ne 60) { throw "An unrelated CA did not produce certificate error 60 (got $LASTEXITCODE)" }
+          } finally { Remove-Item -LiteralPath $untrusted -Recurse -Force -ErrorAction Stop }
+          Write-Host 'WINDOWS MITM + CERTIFICATE TRUST OK'
           exit 0
 
       - name: Verify native Windows event watcher
