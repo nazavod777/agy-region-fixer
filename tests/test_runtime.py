@@ -24,6 +24,8 @@ if os.name == "posix":
 ROOT = Path(__file__).resolve().parents[1]
 SCRATCH = Path(tempfile.gettempdir()) / "agy-runtime-regressions"
 BASH = "/bin/bash" if Path("/bin/bash").is_file() else shutil.which("bash")
+TERMINAL_WAIT_SECONDS = 8
+TERMINAL_OUTPUT_LIMIT = 65536
 
 
 def process_details(pid):
@@ -232,25 +234,9 @@ mktemp() {
                     os.killpg(process.pid, interrupt)
                 else:
                     os.kill(process.pid, interrupt)
-            status = process.wait(timeout=8)
+            status = self.read_terminal_until_exit(process, master, output)
             if capture_file is not None:
                 self.assertFalse(capture_file.exists(), "Cancellation left the captured PATH file behind")
-            deadline = time.monotonic() + 2
-            while True:
-                remaining = deadline - time.monotonic()
-                self.assertGreater(remaining, 0, "An owned process kept the terminal open")
-                readable, _, _ = select.select([master], [], [], remaining)
-                self.assertTrue(readable, "An owned process kept the terminal open")
-                try:
-                    chunk = os.read(master, 4096)
-                except OSError as error:
-                    if error.errno != errno.EIO:
-                        raise
-                    break
-                if not chunk:
-                    break
-                output.extend(chunk)
-                self.assertLess(len(output), 65536, "Unexpected unbounded terminal output")
             return status, output.decode("utf-8", errors="replace")
         except Exception as error:
             diagnostics = self.terminal_diagnostics(process, master, output)
@@ -268,14 +254,48 @@ mktemp() {
         finally:
             os.close(master)
 
+    def read_terminal_until_exit(self, process, master, output):
+        # A PTY writer, and macOS slave close itself, can wait for pending output.
+        # Drain while the process runs rather than waiting for its exit first.
+        deadline = time.monotonic() + TERMINAL_WAIT_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, TERMINAL_WAIT_SECONDS)
+            process.poll()
+            readable, _, _ = select.select([master], [], [], remaining)
+            if not readable:
+                raise subprocess.TimeoutExpired(process.args, TERMINAL_WAIT_SECONDS)
+            try:
+                chunk = os.read(master, 4096)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                chunk = b""
+            if not chunk:
+                return process.wait(timeout=max(0, deadline - time.monotonic()))
+            available = TERMINAL_OUTPUT_LIMIT - len(output)
+            output.extend(chunk[:available])
+            self.assertLessEqual(len(chunk), available, "Unexpected unbounded terminal output")
+
     def terminal_diagnostics(self, process, master, output):
+        # Snapshot identities and states before diagnostic reads can unblock exit.
+        details = []
+        for pid in sorted({process.pid} | {item["pid"] for item in self.owned_processes()}):
+            current = process_details(pid)
+            if current is not None:
+                try:
+                    current["sid"] = os.getsid(pid)
+                except ProcessLookupError:
+                    continue
+            details.append(current if current is not None else {"pid": pid, "state": "absent"})
         deadline = time.monotonic() + 0.2
-        while len(output) < 65536:
+        while len(output) < TERMINAL_OUTPUT_LIMIT:
             readable, _, _ = select.select([master], [], [], max(0, deadline - time.monotonic()))
             if not readable:
                 break
             try:
-                chunk = os.read(master, 4096)
+                chunk = os.read(master, min(4096, TERMINAL_OUTPUT_LIMIT - len(output)))
             except OSError as error:
                 if error.errno != errno.EIO:
                     raise
@@ -285,15 +305,6 @@ mktemp() {
             output.extend(chunk)
             if time.monotonic() >= deadline:
                 break
-        details = []
-        for pid in sorted({process.pid} | {item["pid"] for item in self.owned_processes()}):
-            current = process_details(pid)
-            if current is not None:
-                try:
-                    current["sid"] = os.getsid(pid)
-                except ProcessLookupError:
-                    continue
-            details.append(current)
         capture = (self.capture_path.read_text(encoding="utf-8").rstrip("\n")
                    if self.capture_path.exists() else None)
         trace = ""
@@ -332,6 +343,14 @@ printf 'OWNER_PATH=%s\\n' "$OWNER_PATH"
 """)
         self.assertEqual(status, 0, output)
         self.assertIn("OWNER_PATH=" + expected, output)
+
+    def test_terminal_output_is_drained_while_the_process_runs(self):
+        payload_size = 32768
+        command = self.fixture("sys.stdout.buffer.write(b'x' * %s)\nsys.stdout.buffer.flush()\n" % payload_size)
+        status, output = self.run_in_terminal(command)
+        self.assertEqual(status, 0)
+        self.assertEqual(output, "x" * payload_size)
+        self.assert_owned_processes_stopped()
 
     def test_stopped_command_cannot_defeat_the_timeout(self):
         command = self.fixture("os.kill(os.getpid(), signal.SIGSTOP)\n")
