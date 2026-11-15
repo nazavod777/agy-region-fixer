@@ -190,15 +190,15 @@ $env:AGY_BYPASS_PORT="8081"; powershell -ExecutionPolicy Bypass -File install.ps
 
 ## ✅ 测试状态
 
-GitHub Actions 工作流在各系统的原生运行器上检查生命周期：安装 → 代理 + CA + MITM 检查 → shim → 模拟 CLI 更新 → 自愈 → 竞争、被替换链接和符号链接攻击检查 → 还原二进制文件的干净卸载。
+下方链接中的各系统原生 GitHub Actions 任务均已通过。Linux 和 macOS 在 `bc1495b` 上验证；Windows 在 `2cda8ef` 上通过，后续改动仅涉及 Windows 安装脚本、监视程序测试和 Windows CI 步骤。
 
 | 🐧 ubuntu-latest | 🍎 macos-latest | 🪟 windows-latest |
 |:---:|:---:|:---:|
-| systemd | launchd | HKCU Run + schtasks |
+| [✅ systemd](https://github.com/nazavod777/agy-region-fixer/actions/runs/43772344364/job/132990856460) | [✅ launchd](https://github.com/nazavod777/agy-region-fixer/actions/runs/43772344364/job/132990856534) | [✅ HKCU Run + schtasks](https://github.com/nazavod777/agy-region-fixer/actions/runs/43773308497/job/132993835041) |
 
-事件触发修复和插件直接启动仍需在各系统上重新运行工作流；上表说明检查范围，不代表此版本已通过。
+检查使用模拟 CLI，覆盖代理和 CA、事件触发的自动修复、监视程序场景和卸载。Windows 任务还验证了通过代理的 HTTPS 连接及错误 CA 被拒绝。CI 不测试真实的 `agy login` 或真实 CLI 对 Google API 的请求。Windows 运行器使用管理员权限并禁用用户账户控制（UAC），因此普通用户账户下的任务计划程序和真实 AppExecAlias 仍未验证。
 
-CI 不测试真实的 `agy login` 和 Google 流量（使用假的 `agy`）；Linux 路径另外用真实 CLI 和模型做过实机验证（`BYPASS_OK`）。
+此前使用真实 CLI 和模型进行的 Linux 实机检查返回了 `BYPASS_OK`；这是历史结果，不是对此版本的新验证。
 
 ## 🗂️ 目录结构
 

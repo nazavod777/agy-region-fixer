@@ -190,15 +190,15 @@ The proxy runs `addon.py` directly with the venv's Python (`python -I addon.py -
 
 ## ✅ Test status
 
-The GitHub Actions workflow covers the lifecycle on native runners: install → proxy + CA + MITM check → shim → simulated CLI update → self-healing → race, planted-link and symlink-attack checks → clean uninstall that restores the binary.
+The native GitHub Actions jobs linked below passed. Linux and macOS were tested at `bc1495b`; Windows passed at `2cda8ef`, after changes limited to the Windows installer, watcher tests and Windows CI step.
 
 | 🐧 ubuntu-latest | 🍎 macos-latest | 🪟 windows-latest |
 |:---:|:---:|:---:|
-| systemd | launchd | HKCU Run + schtasks |
+| [✅ systemd](https://github.com/nazavod777/agy-region-fixer/actions/runs/43772344364/job/132990856460) | [✅ launchd](https://github.com/nazavod777/agy-region-fixer/actions/runs/43772344364/job/132990856534) | [✅ HKCU Run + schtasks](https://github.com/nazavod777/agy-region-fixer/actions/runs/43773308497/job/132993835041) |
 
-Event-triggered repair and the direct addon bootstrap require a fresh native workflow run; the platform list above describes coverage, not a result for this revision.
+The checks use a synthetic CLI and cover the proxy and CA, event-triggered automatic repair, watcher scenarios and uninstall. The Windows job also verified HTTPS through the proxy and rejection of an incorrect CA. CI does not test real `agy login` or real CLI requests to Google's API. Windows runs with administrator privileges and UAC disabled, so Task Scheduler under a standard user account and a real AppExecAlias remain unverified.
 
-A real `agy login` and Google traffic are not tested in CI (fake `agy`); the Linux path was additionally verified live with the real CLI and model (`BYPASS_OK`).
+The earlier live Linux check with the real CLI and model returned `BYPASS_OK`; it is a historical result, not a new check of this revision.
 
 ## 🗂️ Layout
 
