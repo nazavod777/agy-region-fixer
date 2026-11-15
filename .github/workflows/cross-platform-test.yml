@@ -89,6 +89,23 @@ jobs:
         env:
           AGY_BYPASS_PORT: "8090"
 
+      - name: Record Windows proxy startup diagnostics
+        if: runner.os == 'Windows' && always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $prefix = "$env:USERPROFILE\.agy-region-fixer"
+          $ca = Join-Path $prefix 'ca\mitmproxy-ca-cert.pem'
+          if (Test-Path -LiteralPath $ca) {
+            & curl.exe -sS --max-time 15 --cacert $ca -x http://127.0.0.1:8090 -o NUL https://www.google.com/
+            Write-Host "Diagnostic HTTPS proxy exit code: $LASTEXITCODE"
+          }
+          $log = Join-Path $prefix 'mitm-stdout.log'
+          if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Tail 60 }
+          # External connectivity is diagnostic here; local proxy behavior has
+          # separate acceptance tests below.
+          exit 0
+
       - name: Verify native Windows event watcher
         if: runner.os == 'Windows'
         shell: powershell

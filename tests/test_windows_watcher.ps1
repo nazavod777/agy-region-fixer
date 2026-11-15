@@ -36,6 +36,24 @@ function Wait-Until([scriptblock]$condition, [string]$message, [int]$timeout = 1
   } while ($clock.ElapsedMilliseconds -lt $timeout)
   throw "Deadline exceeded: $message"
 }
+function Move-DirectoryWhenReleased([string]$source, [string]$destination) {
+  # Observing the shim precedes transaction cleanup and child exit. Allow only
+  # transient native sharing/access errors; a persistent watcher lock still fails.
+  $deadline = [Diagnostics.Stopwatch]::StartNew()
+  $attempts = 0
+  do {
+    $attempts++
+    try {
+      [IO.Directory]::Move($source, $destination)
+      Write-Host "Application parent rename succeeded after $attempts attempt(s)"
+      return
+    } catch {
+      $errorCode = $_.Exception.InnerException.HResult -band 0xffff
+      if (@(5, 32, 33) -notcontains $errorCode -or $deadline.ElapsedMilliseconds -ge 5000) { throw }
+    }
+    Start-Sleep -Milliseconds 50
+  } while ($true)
+}
 function Invoke-Control([string]$mode, [int]$timeout = 5000) {
   $start = [Diagnostics.ProcessStartInfo]::new()
   $start.FileName = $script:executable
@@ -117,6 +135,54 @@ try {
   Assert-Equal ($counter.GetValue($null) - $before) 1 'Overflow did not invalidate the worker generation'
   Assert-True ($signal.WaitOne(0)) 'Overflow did not signal reconciliation'
 
+  # Windows allows renaming the watched anchor itself, but an open watcher
+  # below it pins that ancestor. Prove the native primitive before our full flow.
+  $primitiveAnchor = Join-Path $scratch 'native-rename-anchor'
+  $primitiveInner = Join-Path $primitiveAnchor 'bin'
+  $primitiveMoved = $primitiveAnchor + '.moved'
+  [void][IO.Directory]::CreateDirectory($primitiveInner)
+  $descendantWatcher = [IO.FileSystemWatcher]::new($primitiveInner)
+  try {
+    $descendantWatcher.EnableRaisingEvents = $true
+    $blocked = $false
+    try { [IO.Directory]::Move($primitiveAnchor, $primitiveMoved) }
+    catch { $blocked = ($_.Exception.InnerException.HResult -band 0xffff) -eq 5 }
+    Assert-True $blocked 'Descendant watcher negative control did not reproduce native ancestor AccessDenied'
+  } finally { $descendantWatcher.Dispose() }
+  $anchorWatcher = [IO.FileSystemWatcher]::new($primitiveAnchor)
+  try {
+    $anchorWatcher.IncludeSubdirectories = $true
+    $anchorWatcher.EnableRaisingEvents = $true
+    Move-DirectoryWhenReleased $primitiveAnchor $primitiveMoved
+    Assert-True ([IO.Directory]::Exists($primitiveMoved)) 'Recursive anchor-only watcher blocked its own rename'
+    Write-Host 'Native directory watcher A/B passed: descendant blocked, recursive anchor allowed rename'
+  } finally { $anchorWatcher.Dispose() }
+
+  # Metadata watches must not add a handle below the application anchor or turn
+  # the profile into a recursive watch. Overlay watches coalesce into the prefix.
+  $watcherType.GetField('prefix', $flags).SetValue($null, $prefix)
+  $plan = $watcherType.GetField('desired', $flags).GetValue($null)
+  $configure = $watcherType.GetMethod('ConfigureSubscriptions', $flags)
+  [void]$configure.Invoke($null, @($shim))
+  Assert-True ($plan.ContainsKey($cliParent) -and $plan[$cliParent]) 'Application anchor was not recursive'
+  Assert-True (-not $plan.ContainsKey($cli)) 'Subscription layout still held a descendant directory handle'
+  Assert-True ($plan.ContainsKey($prefix) -and -not $plan[$prefix]) 'State metadata expanded to a recursive profile watch'
+  Assert-Equal @($plan.GetEnumerator() | Where-Object { $_.Value }).Count 1 'Unexpected recursive watch outside application subtree'
+  $plan.Clear()
+  $overlayShim = Join-Path $prefix 'bin\agy.exe'
+  [void]$configure.Invoke($null, @($overlayShim))
+  Assert-True ($plan[$prefix]) 'Overlay prefix was not a recursive owned anchor'
+  Assert-True (-not $plan.ContainsKey((Join-Path $prefix 'bin'))) 'Overlay configuration recreated a descendant handle'
+  Assert-True (-not $plan.ContainsKey($cli)) 'Overlay watch retained a handle on the external managed launcher directory'
+  $plan.Clear()
+  $driveRoot = [IO.Path]::GetPathRoot($shim)
+  $normalizedRoot = $watcherType.GetMethod('FullPath', $flags).Invoke($null, @($driveRoot))
+  Assert-Equal $normalizedRoot $driveRoot 'Drive root became a drive-relative current directory'
+  [void]$configure.Invoke($null, @((Join-Path $driveRoot 'agy.exe')))
+  Assert-True ($plan.ContainsKey($driveRoot) -and -not $plan[$driveRoot]) 'Shallow root path lost its nonrecursive root watch'
+  Assert-Equal @($plan.GetEnumerator() | Where-Object { $_.Value }).Count 0 'Shallow path created a broad recursive watch'
+  $plan.Clear()
+
   # An update preceding startup must be reconciled after subscribing, without
   # needing another filesystem event.
   Copy-Update $shim
@@ -161,7 +227,7 @@ try {
   # A whole logical parent can be renamed away. Subscriptions on its ancestors
   # must discover the recreated path and recover config from prefix metadata.
   $retired = $cliParent + '.retired'
-  [IO.Directory]::Move($cliParent, $retired)
+  Move-DirectoryWhenReleased $cliParent $retired
   [void][IO.Directory]::CreateDirectory($cli)
   Copy-Update $shim 15MB
   $expected = Get-Digest $shim

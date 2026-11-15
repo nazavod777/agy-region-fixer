@@ -124,6 +124,8 @@ Events are coalesced before repair. The healer waits for a quiet candidate and c
 
 If an updater deletes an in-place target before creating its replacement, event-triggered repair leaves it `Pending` rather than restoring the shim into that gap. If the target stays missing, a manual run or the five-minute fallback repairs it from the saved binary. Managed launchers remain untouched; only this tool's wrapper is repaired.
 
+On Windows, moving or renaming higher-level directories, such as the user profile, may require stopping the watcher first. The five-minute fallback does not release directory handles or unblock such a move.
+
 Run repair manually:
 
 - 🐧 `sudo agy-bypass-heal`

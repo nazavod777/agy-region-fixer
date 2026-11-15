@@ -1498,7 +1498,8 @@ internal static class AgyWatcher
     private static int generation;
     private static string prefix;
     private static readonly List<FileSystemWatcher> subscriptions = new List<FileSystemWatcher>();
-    private static Dictionary<string, HashSet<string>> desired;
+    private static readonly HashSet<string> logicalPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, bool> desired = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
 
     // Callbacks never touch disk or run PowerShell. The sole worker reconciles
     // the latest state, including changes delivered while a repair is running.
@@ -1515,7 +1516,8 @@ internal static class AgyWatcher
     private static string FullPath(string path)
     {
         if (!Path.IsPathRooted(path)) throw new IOException("An absolute path is required: " + path);
-        return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        string full = Path.GetFullPath(path);
+        return full.Length == Path.GetPathRoot(full).Length ? full : full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
     }
     private static void AssertUnlinked(string path)
     {
@@ -1541,18 +1543,72 @@ internal static class AgyWatcher
         string current = FullPath(path);
         while (!String.IsNullOrEmpty(current))
         {
+            if (logicalPaths.Count >= MaximumWatches && !logicalPaths.Contains(current))
+                throw new IOException("Watcher path depth exceeds its bounded logical-path limit.");
+            logicalPaths.Add(current);
             string parent = Path.GetDirectoryName(current);
             if (String.IsNullOrEmpty(parent) || String.Equals(parent, current, StringComparison.OrdinalIgnoreCase)) break;
-            HashSet<string> names;
-            if (!desired.TryGetValue(parent, out names))
-            {
-                if (desired.Count >= MaximumWatches) throw new IOException("Watcher path depth exceeds its bounded subscription limit.");
-                names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                desired.Add(parent, names);
-            }
-            names.Add(Path.GetFileName(current));
             current = parent;
         }
+    }
+    private static bool SamePath(string left, string right)
+    {
+        return String.Equals(FullPath(left), FullPath(right), StringComparison.OrdinalIgnoreCase);
+    }
+    private static bool Beneath(string path, string ancestor)
+    {
+        return FullPath(path).StartsWith(FullPath(ancestor).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+    private static bool BroadAnchor(string path)
+    {
+        string full = FullPath(path);
+        string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (SamePath(full, Path.GetPathRoot(full)) || SamePath(full, profile) || Beneath(profile, full)) return true;
+        foreach (var folder in new[] { Environment.SpecialFolder.Windows, Environment.SpecialFolder.System,
+            Environment.SpecialFolder.ProgramFiles, Environment.SpecialFolder.ProgramFilesX86,
+            Environment.SpecialFolder.CommonProgramFiles, Environment.SpecialFolder.CommonProgramFilesX86,
+            Environment.SpecialFolder.CommonApplicationData, Environment.SpecialFolder.ApplicationData,
+            Environment.SpecialFolder.LocalApplicationData })
+        {
+            string shared = Environment.GetFolderPath(folder);
+            if (!String.IsNullOrEmpty(shared) && SamePath(full, shared)) return true;
+        }
+        string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        return !String.IsNullOrEmpty(local) && SamePath(full, Path.Combine(local, "Programs"));
+    }
+    private static void AddWatchAndParents(string directory, bool recursive)
+    {
+        string current = FullPath(directory);
+        while (!String.IsNullOrEmpty(current))
+        {
+            bool previous;
+            desired.TryGetValue(current, out previous);
+            desired[current] = previous || recursive;
+            string parent = Path.GetDirectoryName(current);
+            if (String.IsNullOrEmpty(parent) || String.Equals(parent, current, StringComparison.OrdinalIgnoreCase)) break;
+            current = parent;
+            recursive = false;
+        }
+    }
+    private static void ConfigureSubscriptions(string shim)
+    {
+        string directory = Path.GetDirectoryName(FullPath(shim));
+        string anchor = Path.GetDirectoryName(directory);
+        // A child-directory watch pins its ancestors against rename on Windows,
+        // even with FILE_SHARE_DELETE. Keep the application subtree behind one
+        // recursive handle on its anchor, never handles inside that subtree.
+        bool recursive = !String.IsNullOrEmpty(anchor) && !BroadAnchor(anchor);
+        if (!recursive) anchor = directory;
+        AddWatchAndParents(anchor, recursive);
+        // Metadata needs a direct owned-prefix watch, never a recursive profile
+        // watch. Managed launchers stay external and need no directory handles.
+        AddWatchAndParents(prefix, false);
+        var covered = new List<string>();
+        foreach (var pair in desired)
+            foreach (var candidate in desired)
+                if (candidate.Value && Beneath(pair.Key, candidate.Key)) { covered.Add(pair.Key); break; }
+        foreach (string path in covered) desired.Remove(path);
+        if (desired.Count > MaximumWatches) throw new IOException("Watcher subscription count exceeds its bounded limit.");
     }
     private static void RefreshSubscriptions()
     {
@@ -1564,22 +1620,21 @@ internal static class AgyWatcher
             foreach (var pair in desired)
             {
                 if (!Directory.Exists(pair.Key)) continue;
-                // Source directories may be package-manager junctions. These
-                // subscriptions only observe; writable paths are checked by heal.
-                var names = pair.Value;
+                // Subscriptions only observe; heal validates every writable path.
+                var names = logicalPaths;
                 var watcher = new FileSystemWatcher(pair.Key);
                 next.Add(watcher);
-                watcher.IncludeSubdirectories = false;
+                watcher.IncludeSubdirectories = pair.Value;
                 watcher.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size;
                 watcher.InternalBufferSize = 8192;
                 FileSystemEventHandler onChange = delegate(object sender, FileSystemEventArgs args) {
-                    if (names.Contains(args.Name)) Dirty(sender, args);
+                    if (names.Contains(args.FullPath)) Dirty(sender, args);
                 };
                 watcher.Changed += onChange;
                 watcher.Created += onChange;
                 watcher.Deleted += onChange;
                 watcher.Renamed += delegate(object sender, RenamedEventArgs args) {
-                    if (names.Contains(args.Name) || names.Contains(args.OldName)) Dirty(sender, args);
+                    if (names.Contains(args.FullPath) || names.Contains(args.OldFullPath)) Dirty(sender, args);
                 };
                 watcher.Error += Overflow;
                 watcher.EnableRaisingEvents = true;
@@ -1704,10 +1759,12 @@ internal static class AgyWatcher
         string disabled = Path.Combine(prefix, "watcher.disabled");
         AssertUnlinked(disabled);
         if (File.Exists(disabled)) return 0;
-        desired = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
         AssertUnlinked(args[2]);
-        foreach (string path in new[] { args[2], args[3], Path.Combine(Path.GetDirectoryName(FullPath(args[2])), "agy-launcher.json"), Path.Combine(prefix, "shim-state.json") })
+        string shimDirectory = Path.GetDirectoryName(FullPath(args[2]));
+        foreach (string path in new[] { args[2], Path.Combine(shimDirectory, "agy-launcher.json"), Path.Combine(prefix, "shim-state.json") })
             AddLogicalPath(path);
+        if (SamePath(shimDirectory, Path.GetDirectoryName(FullPath(args[3])))) AddLogicalPath(args[3]);
+        ConfigureSubscriptions(args[2]);
         using (var mutex = new Mutex(false, identity + "-owner"))
         {
             bool owned;

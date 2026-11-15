@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,7 +29,7 @@ class UnixHealTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="agy-heal-test-")
         self.addCleanup(self.directory.cleanup)
-        self.path = Path(self.directory.name)
+        self.path = Path(self.directory.name).resolve()
         self.prefix = self.path / "prefix"
         self.prefix.mkdir()
         self.bin = self.path / "bin"
@@ -102,10 +103,14 @@ exec(os.environ.get("AGY_TEST_INJECT", "") + "\\n" + source)
         return process
 
     def stop_process(self, process):
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                if process.poll() is None:
+                    raise
         process.communicate(timeout=5)
 
     def finish(self, process):
@@ -204,6 +209,53 @@ exec(os.environ.get("AGY_TEST_INJECT", "") + "\\n" + source)
         self.assertFalse((self.bin / ".agy-region-fixer-stage").exists())
         self.heal()
         self.assert_repaired(self.old)
+
+    def test_missing_target_under_symlinked_parent_waits_and_recovers(self):
+        alias = self.path / "alias-bin"
+        alias.symlink_to(self.bin, target_is_directory=True)
+        self.register(alias / "agy")
+        self.target.unlink()
+        process = self.start_heal("--event")
+        self.wait_ready()
+        self.assertFalse(self.target.exists())
+        self.assertEqual(self.real.read_bytes(), self.old)
+        descriptor = os.open(self.target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o755)
+        with os.fdopen(descriptor, "wb") as candidate:
+            candidate.write(self.updated)
+        self.finish(process)
+        self.assert_repaired()
+        self.target.unlink()
+        self.assertIn("Pending", self.heal("--event"))
+        self.assertFalse(self.target.exists())
+        self.heal()
+        self.assert_repaired()
+        self.assertTrue(alias.is_symlink())
+
+    def test_cleanup_does_not_signal_a_finished_process_group(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        self.addCleanup(self.stop_process, process)
+        self.assertEqual(process.wait(timeout=5), 0)
+        with mock.patch("os.killpg", side_effect=PermissionError("stale process group")) as kill:
+            self.stop_process(process)
+        kill.assert_not_called()
+
+    def test_cleanup_rechecks_exit_after_a_process_group_signal_race(self):
+        for exit_status in (0, None):
+            with self.subTest(exit_status=exit_status):
+                process = mock.Mock(pid=12345)
+                process.poll.side_effect = (None, exit_status)
+                with mock.patch("os.killpg", side_effect=PermissionError("process group exited")):
+                    if exit_status is None:
+                        with self.assertRaises(PermissionError):
+                            self.stop_process(process)
+                        process.communicate.assert_not_called()
+                    else:
+                        self.stop_process(process)
+                        process.communicate.assert_called_once_with(timeout=5)
+                self.assertEqual(process.poll.call_count, 2)
 
     def test_owner_worker_keeps_missing_event_mode(self):
         with self.common_path.open("a", encoding="utf-8") as common:

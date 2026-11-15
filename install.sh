@@ -500,9 +500,10 @@ resolve_link() {
     if [[ "$t" = /* ]]; then p="$t"; else p="$(cd "$(dirname "$p")" && pwd)/$t"; fi
     i=$((i+1))
   done
-  # normalize ../ and symlinked DIRECTORIES (nix profiles link whole bin dirs): the physical
-  # path is where the file really lives. If the file no longer exists — leave as is
-  if [[ -e "$p" ]]; then
+  # Normalize ../ and symlinked directories even when an updater temporarily
+  # removed the binary. The physical parent still identifies the same target.
+  # If the parent itself vanished, leave the path for the next event/timer.
+  if [[ -d "$(dirname "$p")" ]]; then
     p="$(cd -P "$(dirname "$p")" && pwd -P)/$(basename "$p")"
   fi
   printf '%s\n' "$p"
