@@ -86,7 +86,8 @@ try {
     $persistedPort = ([IO.File]::ReadAllText((Join-Path $PREFIX "port"))).Trim()
     Assert-True ($persistedPort -ceq "$PORT") "Actual selection was not saved"
     $runner = [IO.File]::ReadAllText((Join-Path $PREFIX "run-proxy.ps1"))
-    Assert-True ($runner.Contains("-p $persistedPort --set listen_host=127.0.0.1")) "Runner did not use the persisted port"
+    Assert-True ($runner.Contains("--port $persistedPort --confdir")) "Runner did not use the persisted port"
+    Assert-True ($runner.Contains("python.exe") -and $runner.Contains(" -I ")) "Runner did not use the isolated Python bootstrap"
     $PORT = $null
     . ([scriptblock]::Create($selectionBlock))
     Assert-True ($PORT -eq [int]$persistedPort) "Reinstallation changed the free saved port"
@@ -121,7 +122,7 @@ try {
 
   # Process ownership is exact; another installation with a similar path survives.
   & {
-    $venvMitm = "C:\synthetic-profile\.agy-region-fixer\venv\Scripts\mitmdump.exe"
+    $venvMitm = Join-Path $scratch "synthetic-profile/.agy-region-fixer/venv/Scripts/mitmdump.exe"
     $script:stoppedIds = @()
     $script:waitedIds = @()
     function Get-CimInstance {
@@ -134,6 +135,30 @@ try {
     Stop-OurProxy
     Assert-True ($script:stoppedIds.Count -eq 1 -and $script:stoppedIds[0] -eq 12345) "Proxy stop selected another installation"
     Assert-True ($script:waitedIds.Count -eq 1 -and $script:waitedIds[0] -eq 12345) "Proxy stop did not wait for its own process"
+  }
+
+  if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    & {
+      $venvMitm = 'C:\synthetic profile\.agy-region-fixer\venv\Scripts\mitmdump.exe'
+      $python = $venvMitm.Replace('mitmdump.exe', 'python.exe')
+      $prefix = 'C:\synthetic profile\.agy-region-fixer'
+      $command = '"' + $python + '" -I "' + $prefix + '\addon.py" --port 8090 --confdir "' + $prefix + '\ca"'
+      $script:stoppedIds = @()
+      $script:waitedIds = @()
+      function Get-CimInstance {
+        [pscustomobject]@{ ProcessId = 20001; ExecutablePath = $python; CommandLine = $command }
+        [pscustomobject]@{ ProcessId = 20002; ExecutablePath = $python; CommandLine = ($command + ' --addon "' + $prefix + '\custom-addon.py"') }
+        [pscustomobject]@{ ProcessId = 20003; ExecutablePath = $python; CommandLine = $command.Replace('\addon.py', '\addon.py-other') }
+        [pscustomobject]@{ ProcessId = 20004; ExecutablePath = $python; CommandLine = $command.Replace('\ca"', '\ca-other"') }
+        [pscustomobject]@{ ProcessId = 20005; ExecutablePath = $python; CommandLine = ('"' + $python + '" -c "print(1)"') }
+        [pscustomobject]@{ ProcessId = 20006; ExecutablePath = $python; CommandLine = ($command + ' --addon "' + $prefix + '-other\custom-addon.py"') }
+      }
+      function Stop-Process { param($Id, [switch]$Force, $ErrorAction) $script:stoppedIds += $Id }
+      function Wait-Process { param($Id, $Timeout, $ErrorAction) $script:waitedIds += $Id }
+      Stop-OurProxy
+      Assert-True (($script:stoppedIds -join ',') -ceq '20001,20002') "Python proxy stop did not preserve unrelated commands"
+      Assert-True (($script:waitedIds -join ',') -ceq '20001,20002') "Python proxy stop did not wait for its exact owned processes"
+    }
   }
 
   # Execute the generated uninstall template with all system side effects mocked.
@@ -152,9 +177,10 @@ try {
     $script:removedPaths = @()
     $script:removedShimPrefixes = @()
     [IO.Directory]::CreateDirectory($expectedPrefix) | Out-Null
-    [IO.File]::WriteAllText((Join-Path $expectedPrefix "windows-support.ps1"), 'function Remove-AgyWindowsShim { param($Prefix) $script:removedShimPrefixes += $Prefix }')
+    [IO.File]::WriteAllText((Join-Path $expectedPrefix "windows-support.ps1"), 'function Remove-AgyWindowsShim { param($Prefix) $script:removedShimPrefixes += $Prefix }; function Stop-AgyWindowsWatcher { param($Prefix) }')
     function Remove-ItemProperty {}
     function schtasks {}
+    function Get-ScheduledTask { return $null }
     function Get-CimInstance {
       param($ClassName, $Filter, $OperationTimeoutSec, $ErrorAction)
       Assert-True ($OperationTimeoutSec -eq 5) "Uninstall process lookup is unbounded"
@@ -167,7 +193,7 @@ try {
     function Wait-Process { param($Id, $Timeout, $ErrorAction) $script:waitedIds += $Id; Assert-True ($Timeout -eq 5) "Uninstall shutdown wait is unbounded" }
     function Test-Path { return $false }
     function Remove-Item { param($LiteralPath, [switch]$Recurse, [switch]$Force, $ErrorAction) $script:removedPaths += $LiteralPath }
-    $uninstall = $uninstallTemplate[0].Value.Replace("@PREFIX@", $expectedPrefix.Replace("'", "''"))
+    $uninstall = $uninstallTemplate[0].Value.Replace("@PREFIX@", $expectedPrefix.Replace("'", "''")).Replace('# @STOP_PROXY@', ("function Stop-OurProxy {`n" + ${function:Stop-OurProxy}.ToString() + "`n}"))
     . ([scriptblock]::Create($uninstall))
     Assert-True ($script:stoppedIds.Count -eq 1 -and $script:stoppedIds[0] -eq 34567) "Uninstall stopped another installation"
     Assert-True ($script:waitedIds.Count -eq 1 -and $script:waitedIds[0] -eq 34567) "Uninstall did not wait for its own process"

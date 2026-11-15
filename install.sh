@@ -8,7 +8,7 @@
 # loadCodeAssist responses, strips the ineligibleTiers field — the CLI sees only
 # allowedTiers and lets the user in. The agy binary is NOT patched or modified,
 # so CLI updates break nothing; the shim heals itself
-# (instantly via a path unit/WatchPaths, plus a timer every 5 minutes)
+# (via a path unit/WatchPaths, plus a timer every 5 minutes)
 # after a CLI update.
 #
 # Install:     curl -fsSL <url>/install.sh | bash        (macOS)
@@ -347,12 +347,13 @@ if [[ -n "${SCRIPT_DIR:-}" && -f "$SCRIPT_DIR/addon.py" && -f "$SCRIPT_DIR/insta
   ADDON_SRC="$SCRIPT_DIR/addon.py"
 else
   ADDON_SRC="$PREFIX/addon.py.tmpl"
-  curl -fsSL "${AGY_ADDON_URL:-$RAW_BASE/addon.py}" -o "$ADDON_SRC" \
-    || err "failed to download addon.py (${AGY_ADDON_URL:-$RAW_BASE/addon.py})"
+  curl -fsSL "$RAW_BASE/addon.py" -o "$ADDON_SRC" \
+    || err "failed to download addon.py ($RAW_BASE/addon.py)"
 fi
 # placeholders are substituted by python as string literals (json.dumps): paths with
 # quotes, backslashes and sed metacharacters do not break the addon
-"${CLEAN_ENV[@]}" "$PYBIN" -I -c '
+install_addon_source() {
+  "${CLEAN_ENV[@]}" "$PYBIN" -I -c '
 import json, sys
 src, dst, log, flag = sys.argv[1:5]
 def literal(value):
@@ -362,13 +363,27 @@ with open(src, encoding="utf-8") as f:
 text = text.replace("@@LOG@@", literal(log)).replace("@@VERBOSE_FLAG@@", literal(flag))
 with open(dst, "w", encoding="utf-8", newline="") as f:
     f.write(text)
-' "$ADDON_SRC" "$PREFIX/addon.py" "$PREFIX/mitm.log" "$PREFIX/verbose.flag"
+' "$1" "$2" "$PREFIX/mitm.log" "$PREFIX/verbose.flag"
+  if grep -q '@@LOG@@\|@@VERBOSE_FLAG@@' "$2"; then
+    err "unsubstituted placeholders left in $2"
+  fi
+  "${CLEAN_ENV[@]}" "$PYBIN" -I -c 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' "$2" \
+    || err "the generated $2 does not compile"
+}
+install_addon_source "$ADDON_SRC" "$PREFIX/addon.py"
 [[ "$ADDON_SRC" == "$PREFIX/addon.py.tmpl" ]] && rm -f "$ADDON_SRC"
-if grep -q '@@LOG@@\|@@VERBOSE_FLAG@@' "$PREFIX/addon.py"; then
-  err "unsubstituted placeholders left in addon.py"
+CUSTOM_EXEC_ARGS=""; CUSTOM_PLIST_ARGS=""
+if [[ -n "${AGY_ADDON_URL:-}" ]]; then
+  # Keep the existing hook-only custom addon contract: the default addon owns
+  # startup and loads the custom module once, without mitmdump's script watcher.
+  CUSTOM_SOURCE="$PREFIX/custom-addon.py.tmpl"
+  curl -fsSL "$AGY_ADDON_URL" -o "$CUSTOM_SOURCE" \
+    || err "failed to download the custom addon ($AGY_ADDON_URL)"
+  install_addon_source "$CUSTOM_SOURCE" "$PREFIX/custom-addon.py"
+  rm -f "$CUSTOM_SOURCE"
+  CUSTOM_EXEC_ARGS=" --addon \"$PREFIX/custom-addon.py\""
+  CUSTOM_PLIST_ARGS="    <string>--addon</string><string>$(xml_esc "$PREFIX/custom-addon.py")</string>"
 fi
-"${CLEAN_ENV[@]}" "$PYBIN" -I -c 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' "$PREFIX/addon.py" \
-  || err "the generated addon.py does not compile"
 
 # ---------------------------------------------------------------------------
 say "3/6 Proxy autostart (selecting a localhost port)"
@@ -385,7 +400,7 @@ Description=Antigravity region fixer (MITM, cleans ineligibleTiers)
 After=network-online.target
 
 [Service]
-ExecStart="$VENV/bin/mitmdump" -s "$PREFIX/addon.py" -p $PORT --set listen_host=127.0.0.1 --set "confdir=$CA_DIR"
+ExecStart="$VENV/bin/python" -I "$PREFIX/addon.py" --port $PORT --confdir "$CA_DIR"$CUSTOM_EXEC_ARGS
 Restart=always
 RestartSec=3
 
@@ -409,11 +424,11 @@ else  # macOS: LaunchAgent for the current user
 <plist version="1.0"><dict>
   <key>Label</key><string>com.agy.region-fixer</string>
   <key>ProgramArguments</key><array>
-    <string>$X_VENV/bin/mitmdump</string>
-    <string>-s</string><string>$X_PREFIX/addon.py</string>
-    <string>-p</string><string>$PORT</string>
-    <string>--set</string><string>listen_host=127.0.0.1</string>
-    <string>--set</string><string>confdir=$X_CA_DIR</string>
+    <string>$X_VENV/bin/python</string>
+    <string>-I</string><string>$X_PREFIX/addon.py</string>
+    <string>--port</string><string>$PORT</string>
+    <string>--confdir</string><string>$X_CA_DIR</string>
+$CUSTOM_PLIST_ARGS
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -468,7 +483,10 @@ chmod 755 "$PREFIX"
 SHIM_MARKER="agy-region-fixer-shim"
 MIN_REAL_BYTES=10000000   # a real agy is ≥10 MB; smaller — an unfinished update/garbage
 LOCK_WAIT_SECONDS=120
-STABLE_CHECKS=15          # ×2 s = cap on waiting for the size to settle, ~30 s
+HEAL_QUIET_SECONDS=0.5    # active-event coalescing; no resident polling loop
+HEAL_WAIT_SECONDS=30      # total readiness and staging deadline per entry
+HEAL_MISSING_SECONDS=2   # allow delete-then-rename updates before manual/timer recovery
+HEAL_EVENT=0
 
 # is this our shim: marker in the first 256 bytes (we do not read the whole binary)
 is_our_shim() { head -c 256 "$1" 2>/dev/null | grep -aq "$SHIM_MARKER"; }
@@ -508,12 +526,37 @@ exec "$REAL" "$@"
 SHIMBODY
 }
 
-# atomic write of shim $2 for binary $1: mktemp (O_EXCL, random name) + chmod 755
-# before mv — the reader never sees a window of "file exists, x bit missing". Runs with the rights of the
-# directory owner (see the security model), so a race on the file name grants no privileges
+# Keep temporary shim writes outside the directly watched parent. A failed
+# refresh or launcher repair must not continually trigger another failed repair.
+shim_stage_directory() {
+  "$PREFIX_SH/venv/bin/python" -I - "$1" <<'STAGEEOF'
+import os
+import stat
+import sys
+
+stage = os.path.join(os.path.dirname(sys.argv[1]), ".agy-region-fixer-stage")
+try:
+    try:
+        os.mkdir(stage, 0o700)
+    except FileExistsError:
+        pass
+    info = os.stat(stage, follow_symlinks=False)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise PermissionError("staging directory must be owned by the worker with mode 0700")
+except OSError as error:
+    print("[heal] Blocked: cannot prepare %s: %s" % (stage, error), file=sys.stderr)
+    sys.exit(1)
+print(stage)
+STAGEEOF
+}
+
+# Atomic shim publication: O_EXCL temporary file + chmod 755 before mv.
+# Runs with the directory owner's rights (see the security model).
 write_shim() {
-  local real="$1" dst="$2" ca_dir="${3:-}" tmp
-  tmp="$(mktemp "$dst.XXXXXX")" || return 1
+  local real="$1" dst="$2" ca_dir="${3:-}" tmp stage
+  stage="$(shim_stage_directory "$dst")" || return 1
+  tmp="$(mktemp "$stage/$(basename "$dst").shim.XXXXXX")" || return 1
   if render_shim "$real" "$ca_dir" > "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$dst"; then
     return 0
   fi
@@ -610,6 +653,7 @@ unwrap_entry() {
   [[ -n "$wrapper" ]] || return 0
   if [[ -f "$wrapper" && ! -L "$wrapper" ]] && is_our_shim "$wrapper"; then
     rm -f "$wrapper" && echo "removed wrapper: $wrapper"
+    rmdir "$(dirname "$wrapper")/.agy-region-fixer-stage" 2>/dev/null || true
   fi
   if [[ -n "$ca_dir" && "$ca_dir" != "$CA_SH" ]]; then
     # Snap aliases share a CA directory. Keep it while another installed wrapper
@@ -622,10 +666,260 @@ unwrap_entry() {
   fi
 }
 
+# Stage a replacement without moving the updater's file into .real. Readiness is
+# evidence of a quiet file, not proof that an arbitrary updater has committed its
+# transaction. A changed candidate is left Pending for another event/timer run.
+repair_binary() {
+  local entry="$1" target="$2" force="$3" shim_text
+  shim_text="$(render_shim "$target.real")" || return 1
+  "$PREFIX_SH/venv/bin/python" -I - "$entry" "$target" "$shim_text" "$force" \
+    "$MIN_REAL_BYTES" "$HEAL_QUIET_SECONDS" "$HEAL_WAIT_SECONDS" \
+    "$HEAL_MISSING_SECONDS" "$HEAL_EVENT" <<'REPAIREOF'
+import json
+import os
+import signal
+import stat
+import sys
+import tempfile
+import time
+
+entry, target, shim_text = sys.argv[1:4]
+force, minimum = map(int, sys.argv[4:6])
+quiet, wait, missing_grace = map(float, sys.argv[6:9])
+event = bool(int(sys.argv[9]))
+real = target + ".real"
+deadline = time.monotonic() + wait
+staged = backup = shim = None
+published = False
+failed = False
+stage_safe = False
+stage_dir = os.path.join(os.path.dirname(target), ".agy-region-fixer-stage")
+blocked_path = os.path.join(stage_dir, os.path.basename(target) + ".blocked.json")
+
+
+def cancel(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+for signum in (signal.SIGTERM, signal.SIGHUP):
+    signal.signal(signum, cancel)
+
+
+def signature(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def metadata(path):
+    try:
+        return os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def current(expected):
+    info = metadata(target)
+    return (os.path.realpath(entry) == os.path.abspath(target)
+            and (signature(info) if info else None) == expected)
+
+
+def pending(reason):
+    print("[heal] Pending: %s — %s; retry on the next event or timer" % (target, reason))
+
+
+def temporary(suffix):
+    descriptor, path = tempfile.mkstemp(prefix=os.path.basename(target) + suffix,
+                                        dir=stage_dir)
+    return descriptor, path
+
+
+def failure_state():
+    return [list(signature(info)) if info is not None else None
+            for info in (metadata(target), metadata(real))]
+
+
+def repair():
+    global staged, backup, shim, published, stage_safe
+    previous = object()
+    stable_since = missing_since = time.monotonic()
+    expected = None
+    while True:
+        now = time.monotonic()
+        info = metadata(target)
+        state = signature(info) if info else None
+        if (os.path.realpath(entry) != os.path.abspath(target)
+                or (info is not None and stat.S_ISLNK(info.st_mode))):
+            pending("entry changed or became a symlink")
+            return
+        if info and (not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111):
+            raise PermissionError("candidate is not a regular executable")
+        if info and info.st_mode & (stat.S_ISUID | stat.S_ISGID):
+            raise PermissionError("candidate has setuid/setgid bits; refusing a privileged copy")
+        if state != previous:
+            previous, stable_since = state, now
+            if info is None:
+                missing_since = now
+        if info is None:
+            if now - missing_since >= missing_grace:
+                if event:
+                    pending("target is missing during an update")
+                    return
+                old = metadata(real)
+                if old is None or not stat.S_ISREG(old.st_mode) or not old.st_mode & 0o111:
+                    print("[heal] Blocked: no regular executable to restore at %s" % real)
+                    return
+                expected = None
+                break
+        elif force or now - stable_since >= quiet:
+            if not force and info.st_size < minimum:
+                pending("candidate is smaller than %s bytes" % minimum)
+                return
+            expected = state
+            break
+        if now >= deadline:
+            pending("readiness deadline expired while the target was changing")
+            return
+        time.sleep(min(0.1, max(0, deadline - now)))
+
+    old = metadata(real)
+    if old is not None and not stat.S_ISREG(old.st_mode):
+        print("[heal] Blocked: %s is not a regular file" % real)
+        return
+    # Parent path observers see one creation, but no staged-file churn inside
+    # this private directory. A failed candidate must not trigger itself forever.
+    try:
+        os.mkdir(stage_dir, 0o700)
+    except FileExistsError:
+        pass
+    directory = os.stat(stage_dir, follow_symlinks=False)
+    if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid()
+            or stat.S_IMODE(directory.st_mode) != 0o700):
+        print("[heal] Blocked: unsafe staging directory %s" % stage_dir)
+        return
+    stage_safe = True
+    if event and not force:
+        try:
+            with open(blocked_path, encoding="utf-8") as blocked:
+                if json.load(blocked) == failure_state():
+                    print("[heal] Blocked: %s is unchanged after a failed repair; timer/manual retry" % target)
+                    return
+        except (FileNotFoundError, ValueError):
+            pass
+    descriptor, shim = temporary(".shim.")
+    with os.fdopen(descriptor, "wb") as destination:
+        destination.write((shim_text + "\n").encode("utf-8"))
+        destination.flush()
+        os.fchmod(destination.fileno(), 0o755)
+        os.fsync(destination.fileno())
+    if expected is not None:
+        descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as source:
+            if signature(os.fstat(source.fileno())) != expected:
+                pending("candidate changed before staging")
+                return
+            descriptor, staged = temporary(".candidate.")
+            with os.fdopen(descriptor, "wb") as destination:
+                while True:
+                    if time.monotonic() >= deadline:
+                        pending("staging deadline expired")
+                        return
+                    block = source.read(1024 * 1024)
+                    if not block:
+                        break
+                    destination.write(block)
+                destination.flush()
+                # A root worker may read a user-owned candidate in a root-only
+                # directory. Copying must not promote its owner/group to root.
+                if os.geteuid() == 0:
+                    os.fchown(destination.fileno(), info.st_uid, info.st_gid)
+                os.fchmod(destination.fileno(), stat.S_IMODE(info.st_mode))
+                os.fsync(destination.fileno())
+            if signature(os.fstat(source.fileno())) != expected or not current(expected):
+                pending("candidate changed while staging")
+                return
+        old = metadata(real)
+        if old is not None:
+            if not stat.S_ISREG(old.st_mode):
+                print("[heal] Blocked: %s is not a regular file" % real)
+                return
+            descriptor, backup = temporary(".previous.")
+            os.close(descriptor)
+            os.unlink(backup)
+            os.link(real, backup, follow_symlinks=False)
+            if signature(os.stat(backup, follow_symlinks=False))[:3] != signature(old)[:3]:
+                pending("previous original changed before staging")
+                return
+        if not current(expected):
+            pending("candidate changed before replacement")
+            return
+        published = True
+        os.replace(staged, real)
+        staged = None
+    if not current(expected):
+        pending("target changed before shim publication")
+        return
+    os.replace(shim, target)
+    # The new original and shim are both in place; the previous original can go.
+    published = False
+    try:
+        os.unlink(blocked_path)
+    except FileNotFoundError:
+        pass
+    print("[heal] %s: %s" % ("shim installed" if force else "restored", target))
+
+
+try:
+    repair()
+except OSError as error:
+    failed = True
+    print("[heal] Blocked: cannot repair %s: %s" % (target, error), file=sys.stderr)
+    sys.exit(1)
+finally:
+    if published:
+        # Shim publication failed or a concurrent update won the final check.
+        # Preserve the old original; the updater's target has not been moved.
+        try:
+            if backup is not None:
+                os.replace(backup, real)
+            elif metadata(real) is not None:
+                os.unlink(real)
+        except OSError as error:
+            print("[heal] Blocked: cannot restore previous original %s: %s" % (real, error),
+                  file=sys.stderr)
+            failed = True
+            if backup is not None:
+                print("[heal] Blocked: previous original retained at %s" % backup, file=sys.stderr)
+            # Keep the backup for manual recovery if rollback itself failed.
+            backup = None
+    for path in (staged, backup, shim):
+        if path is not None:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+    if failed and stage_safe:
+        # Cache only hard failures, inside the unwatched staging directory.
+        # Our .real publication/rollback events must not perpetually retry the
+        # same blocked target. A changed candidate or the fallback can retry.
+        record = None
+        try:
+            descriptor, record = temporary(".blocked.")
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                json.dump(failure_state(), output)
+            os.replace(record, blocked_path)
+            record = None
+        except OSError as error:
+            print("[heal] Blocked: cannot record failed candidate %s: %s" % (target, error),
+                  file=sys.stderr)
+        finally:
+            if record is not None:
+                os.unlink(record)
+REPAIREOF
+}
+
 # --- working operations on a single shim.path entry (print log lines) -------
-# $1 — shim.path entry, $2 — force: 1 on install (no size check)
+# $1 — shim.path entry, $2 — force: 1 on install (no minimum-size check)
 shim_entry() {
-  local entry="$1" force="$2" target size prev stable i
+  local entry="$1" force="$2" target
   target="$(resolve_link "$entry")"
   if [[ -n "$(wrapper_field "$entry" 2)" ]] || is_launcher "$target"; then
     wrap_entry "$entry" "$force"; return
@@ -633,50 +927,19 @@ shim_entry() {
   [[ -e "$target" || -e "$target.real" ]] || return 0
   if is_our_shim "$target"; then
     if [[ "$force" -eq 1 ]] || ! cmp -s "$target" <(render_shim "$target.real"); then
-      # Refresh registered shims when the proxy port/CA changes, including entries
-      # other than the one found first in PATH. Identical shims stay untouched.
       write_shim "$target.real" "$target" || { echo "[heal] FAILED to update shim for $target"; return 1; }
       echo "[heal] shim updated: $target"
     fi
     return 0
   fi
-  [[ ! -d "$target.real" ]] || { echo "[heal] $target.real is a directory — left as is"; return 1; }
-  if [[ -f "$target" ]]; then
-    if [[ "$force" -ne 1 ]]; then
-      # wait for the size to settle: the updater may still be writing the file. A blind sleep
-      # does not help on a slow connection, and an mv mid-write leaves a broken agy.real.
-      # Not settled — leave: the next trigger will retry.
-      size=0; prev=-1; stable=0
-      for i in $(seq 1 "$STABLE_CHECKS"); do
-        size=$(wc -c < "$target" 2>/dev/null | tr -d '[:space:]'); size=${size:-0}
-        if [[ "$size" = "$prev" ]]; then stable=1; break; fi
-        prev="$size"; sleep 2
-      done
-      if [[ "$stable" -ne 1 ]]; then
-        echo "[heal] $target is still being written (size=$size) — left as is"; return 0
-      fi
-      if [[ "$size" -lt "$MIN_REAL_BYTES" ]]; then
-        # not a binary: unfinished update or garbage — do NOT overwrite agy.real
-        echo "[heal] suspicious $target (size=$size < $MIN_REAL_BYTES) — left as is"; return 0
-      fi
-      # the entry may have been switched during the wait (e.g. agy replaced by a symlink):
-      # the mv below would then move the new link into agy.real. The change re-triggers heal
-      if [[ -L "$target" || "$(resolve_link "$entry")" != "$target" ]]; then
-        echo "[heal] $entry changed while waiting — left for the next run"; return 0
-      fi
-    fi
-    mv -f "$target" "$target.real" || { echo "[heal] FAILED to move $target"; return 1; }
-  fi
-  write_shim "$target.real" "$target" || { echo "[heal] FAILED to write shim for $target"; return 1; }
-  if [[ "$force" -eq 1 ]]; then echo "[heal] shim installed: $target (real binary -> $target.real)"
-  else echo "[heal] restored $target"; fi
+  repair_binary "$entry" "$target" "$force"
 }
 
 # put the real binary back (uninstall). We restore the binary even when agy has vanished
 # (interrupted update/heal): otherwise it would stay only under the name agy.real. If
 # something foreign sits in agy's place — we leave it alone
 restore_entry() {
-  local target; target="$(resolve_link "$1")"
+  local target stage; target="$(resolve_link "$1")"
   if [[ -n "$(wrapper_field "$1" 2)" ]] || is_launcher "$target"; then
     unwrap_entry "$1"; return
   fi
@@ -684,6 +947,11 @@ restore_entry() {
   if [[ ! -e "$target" ]] || is_our_shim "$target"; then
     mv -f "$target.real" "$target" || { echo "FAILED to restore $target"; return 1; }
     echo "restored: $target"
+    stage="$(dirname "$target")/.agy-region-fixer-stage"
+    if [[ -d "$stage" && ! -L "$stage" && -O "$stage" ]]; then
+      rm -f "$stage/$(basename "$target").blocked.json"
+      rmdir "$stage" 2>/dev/null || true
+    fi
   else
     echo "left as is: $target is not our shim; the previous binary is in $target.real"
   fi
@@ -729,13 +997,15 @@ chmod 644 "$PREFIX/common.sh"
 # heal.sh: if a CLI update overwrote the shim — restores it.
 # Modes: (no arguments) — repair all shim.path entries; --place ENTRY — install
 # or update the shim (install.sh); --restore — put the real binaries back (uninstall.sh).
-# Heal triggers: systemd path unit (Linux, instant), launchd WatchPaths (macOS),
-# a timer every 5 minutes (safety net, all OSes) and a manual run.
+# Heal triggers: systemd PathChanged (Linux), launchd WatchPaths (macOS),
+# a timer every 5 minutes (safety net, all OSes) and a manual run. --event
+# defers missing in-place targets; the timer/manual mode can recover a vanished shim.
 {
   printf '#!/bin/bash\nSELF=%q\n. %q\n' "$PREFIX/heal.sh" "$PREFIX/common.sh"
   cat <<'HEALEOF'
 ACTION=heal; ENTRY=""
 case "${1:-}" in
+  --event) HEAL_EVENT=1 ;;
   --place)   ACTION=place;   ENTRY="${2:?}" ;;
   --restore-entry) ACTION=restore-one; ENTRY="${2:?}" ;;
   --restore) ACTION=restore ;;
@@ -745,6 +1015,7 @@ esac
 run_worker() {   # $1 = heal|place|restore, $2 = entry
   case "$1" in
     heal)    shim_entry "$2" 0 ;;
+    event)   HEAL_EVENT=1; shim_entry "$2" 0 ;;
     place)   shim_entry "$2" 1 ;;
     restore) restore_entry "$2" ;;
   esac
@@ -770,7 +1041,8 @@ run_entry() {   # $1 = heal|place|restore, $2 = entry; prints the log, returns t
     mode="$(entry_mode "$entry" "$target")"
   fi
   case "$mode" in
-    owner)  out="$(drop_to_owner env AGY_HEAL_LOCKED=1 bash "$SELF" --worker "$action" "$entry" 2>&1)"; rc=$? ;;
+    owner)  [[ "$action" != heal || "$HEAL_EVENT" -ne 1 ]] || action=event
+            out="$(drop_to_owner env AGY_HEAL_LOCKED=1 bash "$SELF" --worker "$action" "$entry" 2>&1)"; rc=$? ;;
     refuse) out="[heal] refused: $entry -> $target — only root can write there, but the path is user-controlled"; rc=1 ;;
     *)      out="$(run_worker "$action" "$entry" 2>&1)"; rc=$? ;;
   esac
@@ -971,7 +1243,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-say "5/6 Shim self-healing after CLI updates (instant + every 5 minutes)"
+say "5/6 Shim self-healing after CLI updates (events + every 5 minutes)"
 "$PREFIX/heal.sh"   # propagate the selected port to every registered owned shim
 # what the path units/WatchPaths should watch: the path from shim.path and its resolved target (no duplicates)
 watch_targets() {
@@ -981,11 +1253,11 @@ watch_targets() {
     r="$(resolve_link "$p")"
     if is_launcher "$r"; then
       # the launcher is never modified: what can disappear or be overwritten is our wrapper
-      w="$(wrapper_field "$p" 2)"; [[ -z "$w" ]] || printf '%s\n' "$w"
+      w="$(wrapper_field "$p" 2)"; [[ -z "$w" ]] || printf '%s\n' "$w" "$(dirname "$w")"
       continue
     fi
-    printf '%s\n' "$p"
-    [[ "$r" == "$p" ]] || printf '%s\n' "$r"
+    printf '%s\n' "$p" "$(dirname "$p")"
+    [[ "$r" == "$p" ]] || printf '%s\n' "$r" "$(dirname "$r")"
   done < "$PREFIX/shim.path" | awk '!seen[$0]++'
 }
 
@@ -1004,6 +1276,15 @@ StartLimitIntervalSec=0
 Type=oneshot
 ExecStart="$PREFIX/heal.sh"
 UNIT2
+  cat > /etc/systemd/system/agy-region-fixer-heal-event.service <<UNITEVENT
+[Unit]
+Description=Restore agy region-fixer shim after a filesystem event
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart="$PREFIX/heal.sh" --event
+UNITEVENT
   cat > /etc/systemd/system/agy-region-fixer-heal.timer <<UNIT3
 [Unit]
 Description=Heal agy shim every 5 minutes
@@ -1015,23 +1296,25 @@ OnUnitActiveSec=5min
 [Install]
 WantedBy=timers.target
 UNIT3
-  # instant reactor: the path unit watches the binaries from shim.path; the timer stays
+  # PathChanged coalesces writer-close events; direct parents catch rename/link
+  # switches without recursive watches. The independent timer stays
   # as a safety net. % is special in unit values — escape it
   PATH_LINES=""
   while IFS= read -r p; do
     p="${p//\%/%%}"
-    PATH_LINES="${PATH_LINES}PathModified=$p
-PathChanged=$p
+    PATH_LINES="${PATH_LINES}PathChanged=$p
 "
   done < <(watch_targets)
   PATH_UNIT=/etc/systemd/system/agy-region-fixer-heal.path
   if [[ -n "$PATH_LINES" ]]; then
     cat > "$PATH_UNIT" <<UNIT4
 [Unit]
-Description=Heal agy shim instantly when the CLI binary changes
+Description=Heal agy shim when the CLI binary changes
 
 [Path]
-${PATH_LINES}[Install]
+${PATH_LINES}Unit=agy-region-fixer-heal-event.service
+
+[Install]
 WantedBy=multi-user.target
 UNIT4
   else
@@ -1041,7 +1324,7 @@ UNIT4
   fi
   systemctl daemon-reload
   # a re-install revives units an earlier version left in the failed state
-  systemctl reset-failed agy-region-fixer-heal.service agy-region-fixer-heal.path >/dev/null 2>&1 || true
+  systemctl reset-failed agy-region-fixer-heal.service agy-region-fixer-heal-event.service agy-region-fixer-heal.path >/dev/null 2>&1 || true
   systemctl enable --now agy-region-fixer-heal.timer >/dev/null 2>&1 \
     || say "⚠️  failed to enable the heal timer — restore the shim manually after a CLI update: sudo agy-bypass-heal"
   # enable the path unit only if it exists: it is not created when no CLI was found
@@ -1050,7 +1333,8 @@ UNIT4
       || say "⚠️  failed to enable the heal path unit — only the every-5-minutes timer works"
   fi
 else
-  # instant reactor: WatchPaths watches the binaries from shim.path; StartInterval is the safety net
+  # WatchPaths observes direct paths/parents; the separate timer can recover a
+  # persistently missing target. Throttling still limits launchd wake-up latency.
   WATCH_LINES=""
   while IFS= read -r p; do
     WATCH_LINES="${WATCH_LINES}    <string>$(xml_esc "$p")</string>
@@ -1064,16 +1348,30 @@ else
 <plist version="1.0"><dict>
   <key>Label</key><string>com.agy.region-fixer-heal</string>
   <key>ProgramArguments</key><array>
-    <string>/bin/bash</string><string>$X_PREFIX/heal.sh</string>
+    <string>/bin/bash</string><string>$X_PREFIX/heal.sh</string><string>--event</string>
   </array>
+  <key>ThrottleInterval</key><integer>1</integer>
   <key>WatchPaths</key><array>
 ${WATCH_LINES}</array>
-  <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><true/>
 </dict></plist>
 PLISTEOF2
   launchctl bootout "gui/$(id -u)" "$HEAL_PLIST" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$(id -u)" "$HEAL_PLIST" || launchctl load -w "$HEAL_PLIST"
+  TIMER_PLIST="$HOME/Library/LaunchAgents/com.agy.region-fixer-heal-timer.plist"
+  cat > "$TIMER_PLIST" <<PLISTTIMER
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.agy.region-fixer-heal-timer</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string><string>$X_PREFIX/heal.sh</string>
+  </array>
+  <key>StartInterval</key><integer>300</integer>
+</dict></plist>
+PLISTTIMER
+  launchctl bootout "gui/$(id -u)" "$TIMER_PLIST" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$TIMER_PLIST" || launchctl load -w "$TIMER_PLIST"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1084,16 +1382,17 @@ say "6/6 Uninstall script"
 OS="$(uname -s)"
 if [[ "$OS" == "Linux" ]]; then
   [[ $EUID -eq 0 ]] || { echo "sudo required"; exit 1; }
-  systemctl disable --now agy-region-fixer.service agy-region-fixer-heal.timer agy-region-fixer-heal.path 2>/dev/null || true
+  systemctl disable --now agy-region-fixer.service agy-region-fixer-heal.timer agy-region-fixer-heal.path agy-region-fixer-heal-event.service 2>/dev/null || true
   rm -f /etc/systemd/system/agy-region-fixer.service
-  rm -f /etc/systemd/system/agy-region-fixer-heal.service /etc/systemd/system/agy-region-fixer-heal.timer /etc/systemd/system/agy-region-fixer-heal.path
+  rm -f /etc/systemd/system/agy-region-fixer-heal.service /etc/systemd/system/agy-region-fixer-heal-event.service /etc/systemd/system/agy-region-fixer-heal.timer /etc/systemd/system/agy-region-fixer-heal.path
   rm -f /usr/local/bin/agy-bypass-heal
   systemctl daemon-reload
 else
   UID_=$(id -u)
   launchctl bootout "gui/$UID_" "$HOME/Library/LaunchAgents/com.agy.region-fixer.plist" 2>/dev/null || true
   launchctl bootout "gui/$UID_" "$HOME/Library/LaunchAgents/com.agy.region-fixer-heal.plist" 2>/dev/null || true
-  rm -f "$HOME/Library/LaunchAgents/com.agy.region-fixer.plist" "$HOME/Library/LaunchAgents/com.agy.region-fixer-heal.plist"
+  launchctl bootout "gui/$UID_" "$HOME/Library/LaunchAgents/com.agy.region-fixer-heal-timer.plist" 2>/dev/null || true
+  rm -f "$HOME/Library/LaunchAgents/com.agy.region-fixer.plist" "$HOME/Library/LaunchAgents/com.agy.region-fixer-heal.plist" "$HOME/Library/LaunchAgents/com.agy.region-fixer-heal-timer.plist"
 fi
 # put the binaries back — under the same lock and the same privilege rules as heal
 # (waits for a heal already in progress: otherwise it would put the shim back over the restored binary)

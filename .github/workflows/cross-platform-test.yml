@@ -89,6 +89,13 @@ jobs:
         env:
           AGY_BYPASS_PORT: "8090"
 
+      - name: Verify native Windows event watcher
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & powershell -NoProfile -NonInteractive -File tests/test_windows_watcher.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Windows event watcher tests failed" }
+
       - name: Verify addon filtering and diagnostics (unix)
         if: runner.os != 'Windows'
         run: |
@@ -173,8 +180,8 @@ jobs:
           AGY="$HOME/.local/bin/agy"
           if [[ "$(uname -s)" == "Linux" ]]; then
             units() {
-              systemctl status --no-pager agy-region-fixer-heal.path agy-region-fixer-heal.service || true
-              sudo journalctl --no-pager -n 30 -u agy-region-fixer-heal.path -u agy-region-fixer-heal.service || true
+              systemctl status --no-pager agy-region-fixer-heal.path agy-region-fixer-heal-event.service || true
+              sudo journalctl --no-pager -n 30 -u agy-region-fixer-heal.path -u agy-region-fixer-heal-event.service || true
             }
             systemctl is-active agy-region-fixer-heal.path || { units; exit 1; }
             # a burst of writes (an updater, a package manager) must not trip the start limit:
@@ -186,8 +193,23 @@ jobs:
             for _ in $(seq 1 25); do grep -q "agy-region-fixer-shim" "$AGY" && break; sleep 1; done
             grep -q "agy-region-fixer-shim" "$AGY" || { echo "FAIL: path unit did not restore the shim"; units; exit 1; }
           else
-            # macOS: instant heal via WatchPaths (functionally exercises the launchd runner)
+            # Observe a real launchd-triggered repair; do not invoke heal manually.
             grep -q WatchPaths "$HOME/Library/LaunchAgents/com.agy.region-fixer-heal.plist"
+            cp "$AGY.real" "$AGY"
+            python - "$AGY" <<'PY'
+          import pathlib, sys, time
+          target = pathlib.Path(sys.argv[1])
+          deadline = time.monotonic() + 30
+          while time.monotonic() < deadline:
+              try:
+                  if b"agy-region-fixer-shim" in target.read_bytes()[:256]:
+                      break
+              except FileNotFoundError:
+                  pass
+              time.sleep(0.1)
+          else:
+              raise SystemExit("launchd did not restore the shim within the deadline")
+          PY
           fi
           echo "INSTANT HEAL OK"
 
@@ -202,6 +224,12 @@ jobs:
           if (-not (Test-Path "$env:USERPROFILE\agy-fake-bin\agy.real.exe")) { throw "agy.real.exe missing" }
           $run = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue
           if (-not $run."agy-region-fixer") { throw "HKCU Run entry was not created" }
+          $watchTask = Get-ScheduledTask -TaskName "agy-region-fixer-watch" -ErrorAction Stop
+          if ($watchTask.State -ne 'Running') { throw "Windows event watcher task is not running" }
+          Copy-Item "$env:USERPROFILE\agy-fake-bin\agy.real.exe" $shim -Force
+          $deadline = [DateTime]::UtcNow.AddSeconds(30)
+          while ([DateTime]::UtcNow -lt $deadline -and -not (Test-AgyNativeShim -Path $shim)) { Start-Sleep -Milliseconds 100 }
+          if (-not (Test-AgyNativeShim -Path $shim)) { throw "Windows watcher did not automatically restore the shim" }
           # simulate a CLI update: put agy.exe back on top
           Copy-Item "$env:USERPROFILE\agy-fake-bin\agy.real.exe" "$env:USERPROFILE\agy-fake-bin\agy.exe" -Force
           powershell -File "$PREFIX\heal.ps1"
@@ -242,6 +270,16 @@ jobs:
         run: |
           set -eo pipefail   # the install output goes through tee
           mkdir -p /tmp/pipe && cp install.sh /tmp/pipe/
+          # Keep both downloads on this checkout, including the default bootstrap
+          # used when AGY_ADDON_URL supplies a hook-only custom script.
+          python - <<'PY'
+          import os, pathlib, re
+          path = pathlib.Path('/tmp/pipe/install.sh')
+          base = pathlib.Path(os.environ['GITHUB_WORKSPACE']).as_uri()
+          source, count = re.subn(r'^RAW_BASE=.*$', 'RAW_BASE="' + base + '"', path.read_text(), flags=re.M)
+          assert count == 1
+          path.write_text(source)
+          PY
           ADDON_URL="file://$GITHUB_WORKSPACE/addon.py"
           # an incomplete python3.13 first on PATH (like a source build without libffi):
           # the installer must skip it and use a working interpreter instead

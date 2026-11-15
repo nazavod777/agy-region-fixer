@@ -3,7 +3,7 @@
 # Requirements: Windows 10/11, Python 3.12 or 3.13 from python.org (tick
 #             "Add to PATH"; mitmproxy 12.x does not support 3.14+ or <3.12),
 #             an installed and logged-in Antigravity CLI (run agy login beforehand).
-# Administrator rights are NOT needed (autostart via HKCU Run).
+# Administrator rights are NOT needed (HKCU proxy autostart and user tasks).
 #
 # Install:    powershell -ExecutionPolicy Bypass -File install.ps1
 # Custom port: $env:AGY_BYPASS_PORT=8081; powershell ... install.ps1
@@ -12,7 +12,7 @@
 # How it works: a local MITM proxy (mitmproxy) strips ineligibleTiers
 # from Google loadCodeAssist responses. The agy.exe binary is NOT modified.
 # The native agy.exe shim supports binaries and managed launchers and is healed
-# every 5 minutes after CLI updates.
+# on filesystem events, with a five-minute fallback after CLI updates.
 #
 # The proxy addon lives in addon.py next to this script (in the repo); for a
 # pipe install (iex (irm ...)) it is downloaded from raw.githubusercontent.com
@@ -113,6 +113,7 @@ New-Item -ItemType Directory -Force -Path $PREFIX, $CA_DIR | Out-Null
 Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
 $venvDir  = Join-Path $PREFIX "venv"
 $venvMitm = Join-Path $venvDir "Scripts\mitmdump.exe"
+$venvPython = Join-Path $venvDir "Scripts\python.exe"
 $venvPrev = "$venvDir.prev"
 $pinVersion = $PIN.Split("=")[-1]
 # output of "mitmdump --version" as text plus its exit status. "Continue" is local to the
@@ -133,8 +134,46 @@ function Test-MitmWorks {
 }
 # OUR proxy copies only (re-install); a running mitmdump.exe locks the venv files
 function Stop-OurProxy {
-  Get-CimInstance Win32_Process -Filter "Name='mitmdump.exe'" -OperationTimeoutSec 5 -ErrorAction SilentlyContinue |
-    Where-Object { $_.ExecutablePath -eq $venvMitm } |
+  # Legacy console launcher and the isolated Python entrypoint have distinct
+  # ownership checks. An unrelated Python process must never be stopped.
+  Get-CimInstance Win32_Process -Filter "Name='mitmdump.exe' OR Name='python.exe'" -OperationTimeoutSec 5 -ErrorAction SilentlyContinue |
+    Where-Object {
+      if ($_.ExecutablePath -eq $venvMitm) { return $true }
+      if ($_.ExecutablePath -notmatch '(?i)[\\/]python\.exe$') { return $false }
+      $pythonPath = Join-Path (Split-Path -Parent $venvMitm) 'python.exe'
+      if ($_.ExecutablePath -ine $pythonPath -or -not $_.CommandLine) { return $false }
+      if (-not ('AgyProxyCommandLine' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class AgyProxyCommandLine {
+    [DllImport("shell32.dll", SetLastError = true)] static extern IntPtr CommandLineToArgvW([MarshalAs(UnmanagedType.LPWStr)] string command, out int count);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+    public static string[] Parse(string command) {
+        int count;
+        IntPtr memory = CommandLineToArgvW(command, out count);
+        if (memory == IntPtr.Zero) throw new InvalidOperationException("Cannot parse the proxy command line.");
+        try {
+            var result = new string[count];
+            for (int index = 0; index < count; index++) result[index] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(memory, index * IntPtr.Size));
+            return result;
+        } finally { LocalFree(memory); }
+    }
+}
+'@ -ErrorAction Stop
+      }
+      try {
+        $arguments = [AgyProxyCommandLine]::Parse($_.CommandLine)
+        $addonPath = Join-Path (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $venvMitm))) 'addon.py'
+        $validCustom = $arguments.Count -eq 7 -or ($arguments.Count -eq 9 -and $arguments[7] -ceq '--addon' -and
+          [IO.Path]::IsPathRooted($arguments[8]) -and [IO.Path]::GetFullPath($arguments[8]) -ieq (Join-Path (Split-Path -Parent $addonPath) 'custom-addon.py'))
+        return $validCustom -and $arguments[0] -ieq $pythonPath -and $arguments[1] -ceq '-I' -and
+          [IO.Path]::IsPathRooted($arguments[2]) -and [IO.Path]::GetFullPath($arguments[2]) -ieq $addonPath -and
+          $arguments[3] -ceq '--port' -and $arguments[4] -cmatch '\A[0-9]{1,5}\z' -and
+          [int]$arguments[4] -ge 1 -and [int]$arguments[4] -le 65535 -and $arguments[5] -ceq '--confdir' -and
+          [IO.Path]::IsPathRooted($arguments[6]) -and [IO.Path]::GetFullPath($arguments[6]) -ieq (Join-Path (Split-Path -Parent $addonPath) 'ca')
+      } catch { return $false }
+    } |
     ForEach-Object {
       Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
       Wait-Process -Id $_.ProcessId -Timeout 5 -ErrorAction SilentlyContinue
@@ -180,13 +219,23 @@ $addonLocal = if ($PSScriptRoot) { Join-Path $PSScriptRoot "addon.py" } else { $
 if ($addonLocal -and (Test-Path $addonLocal)) {
   $addonText = [IO.File]::ReadAllText($addonLocal)
 } else {
-  $addonUrl = if ($env:AGY_ADDON_URL) { $env:AGY_ADDON_URL } else { "$RAWBASE/addon.py" }
-  try { $addonText = (iwr $addonUrl -UseBasicParsing).Content }
+  $addonUrl = "$RAWBASE/addon.py"
+  try { $addonText = (iwr $addonUrl -UseBasicParsing -TimeoutSec 30).Content }
   catch { Die "failed to download addon.py ($addonUrl)" }
 }
 $addonText = $addonText.Replace("@@LOG@@", (ConvertTo-PyLiteral (Join-Path $PREFIX "mitm.log"))).Replace("@@VERBOSE_FLAG@@", (ConvertTo-PyLiteral (Join-Path $PREFIX "verbose.flag")))
 if ($addonText -match "@@(LOG|VERBOSE_FLAG)@@") { Die "unsubstituted placeholders left in addon.py" }
 WriteNoBom (Join-Path $PREFIX "addon.py") $addonText
+$customAddonArgument = ''
+if ($env:AGY_ADDON_URL) {
+  try { $customText = (iwr $env:AGY_ADDON_URL -UseBasicParsing -TimeoutSec 30).Content }
+  catch { Die "failed to download custom addon.py ($env:AGY_ADDON_URL)" }
+  $customText = $customText.Replace("@@LOG@@", (ConvertTo-PyLiteral (Join-Path $PREFIX "mitm.log"))).Replace("@@VERBOSE_FLAG@@", (ConvertTo-PyLiteral (Join-Path $PREFIX "verbose.flag")))
+  if ($customText -match "@@(LOG|VERBOSE_FLAG)@@") { Die "unsubstituted placeholders left in custom addon.py" }
+  WriteNoBom (Join-Path $PREFIX 'custom-addon.py') $customText
+  $customAddonArgument = ' --addon "' + (Join-Path $PREFIX 'custom-addon.py') + '"'
+}
+
 
 # Stop our previous proxy before checking whether its saved port can be reused.
 Stop-OurProxy
@@ -197,7 +246,7 @@ Say "Proxy port: 127.0.0.1:$PORT"
 
 # --- proxy runner ----------------------------------------------------------
 $runPs1 = @"
-& "$(Join-Path $PREFIX 'venv\Scripts\mitmdump.exe')" -s "$(Join-Path $PREFIX 'addon.py')" -p $PORT --set listen_host=127.0.0.1 --set "confdir=$CA_DIR" *>> "$(Join-Path $PREFIX 'mitm-stdout.log')"
+& "$(Join-Path $PREFIX 'venv\Scripts\python.exe')" -I "$(Join-Path $PREFIX 'addon.py')" --port $PORT --confdir "$CA_DIR"$customAddonArgument *>> "$(Join-Path $PREFIX 'mitm-stdout.log')"
 "@
 WriteBom (Join-Path $PREFIX "run-proxy.ps1") $runPs1
 
@@ -264,11 +313,25 @@ function Assert-AgyRegularFile {
   } elseif ([IO.Directory]::Exists($Path)) { throw "Expected a file, found a directory: $Path" }
 }
 
+function Assert-AgyUnlinkedPath {
+  param([string]$Path)
+  $current = Get-AgyFullPath $Path
+  while ($current) {
+    $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+    if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Refusing a linked shim path: $current" }
+    $parent = Split-Path -Parent $current
+    if ($parent -eq $current) { break }
+    $current = $parent
+  }
+}
+
 function Invoke-AgyShimLock {
   param([string]$Prefix, [scriptblock]$Action)
   $Prefix = Get-AgyFullPath $Prefix
   if (-not [IO.Directory]::Exists($Prefix)) { throw "Installation directory does not exist: $Prefix" }
+  Assert-AgyUnlinkedPath $Prefix
   $lockPath = Join-Path $Prefix 'shim.lock'
+  Assert-AgyUnlinkedPath $lockPath
   Assert-AgyRegularFile $lockPath
   $watch = [Diagnostics.Stopwatch]::StartNew()
   $lock = $null
@@ -289,11 +352,13 @@ function Get-AgyUniquePath {
 }
 
 function New-AgyTransaction {
-  return [pscustomobject]@{ Changes = (New-Object 'Collections.Generic.List[object]'); Temps = (New-Object 'Collections.Generic.List[string]'); Committed = $false }
+  return [pscustomobject]@{ Changes = (New-Object 'Collections.Generic.List[object]'); Temps = (New-Object 'Collections.Generic.List[string]'); ExpectedHashes = @{}; Committed = $false }
 }
 
 function New-AgyStagedCopy {
   param($Transaction, [string]$Source, [string]$Destination)
+  Assert-AgyUnlinkedPath $Source
+  Assert-AgyUnlinkedPath $Destination
   $stage = Get-AgyUniquePath $Destination
   $Transaction.Temps.Add($stage)
   [IO.File]::Copy($Source, $stage, $false)
@@ -310,16 +375,23 @@ function New-AgyStagedJson {
 
 function Set-AgyTransactionFile {
   param($Transaction, [string]$Path, [string]$Stage)
+  Assert-AgyUnlinkedPath $Path
   Assert-AgyRegularFile $Path
   $exists = [IO.File]::Exists($Path)
   $backup = Get-AgyUniquePath $Path 'rollback'
   if ($exists) { [IO.File]::Replace($Stage, $Path, $backup) }
   else { [IO.File]::Move($Stage, $Path) }
   $Transaction.Changes.Add([pscustomobject]@{ Path = $Path; Backup = $backup; Existed = $exists })
+  if ($Transaction.ExpectedHashes.ContainsKey($Path)) {
+    if (-not $exists -or (Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash -cne $Transaction.ExpectedHashes[$Path]) {
+      throw "The original changed during repair; the transaction will be rolled back: $Path"
+    }
+  }
 }
 
 function Remove-AgyTransactionFile {
   param($Transaction, [string]$Path)
+  Assert-AgyUnlinkedPath $Path
   Assert-AgyRegularFile $Path
   if (-not [IO.File]::Exists($Path)) { return }
   $backup = Get-AgyUniquePath $Path 'rollback'
@@ -385,6 +457,7 @@ function Read-AgyJson {
 
 function Read-AgyLauncherConfig {
   param([string]$Path)
+  Assert-AgyUnlinkedPath $Path
   $config = Read-AgyJson $Path
   if ($config.version -ne 1 -or @('exe', 'cmd', 'ps1') -notcontains $config.kind -or ($config.port -isnot [int] -and $config.port -isnot [long]) -or $config.port -lt 1 -or $config.port -gt 65535) {
     throw "Unsupported launcher configuration: $Path"
@@ -397,6 +470,7 @@ function Read-AgyLauncherConfig {
 function Read-AgyShimState {
   param([string]$Prefix)
   $path = Join-Path $Prefix 'shim-state.json'
+  Assert-AgyUnlinkedPath $path
   if (-not [IO.File]::Exists($path)) { return $null }
   $state = Read-AgyJson $path
   if ($state.version -ne 1 -or @('inplace', 'overlay') -notcontains $state.mode -or @('exe', 'cmd', 'ps1') -notcontains $state.kind) {
@@ -594,35 +668,78 @@ function Write-AgyHealLog {
 }
 
 function Test-AgyStableUpdate {
-  param([string]$Path)
+  param([string]$Path, [ref]$ReadyHash)
   $previous = $null
   for ($attempt = 0; $attempt -lt 15; $attempt++) {
     try {
-      $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-      if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -lt 10MB) { return $false }
-      $stamp = "$($item.Length):$($item.LastWriteTimeUtc.Ticks)"
-      if ($stamp -ceq $previous) {
-        # Exclusive access also rejects a writer that has not closed the update yet.
-        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
-        try { return $stream.Length -ge 10MB -and $stream.ReadByte() -eq 0x4D -and $stream.ReadByte() -eq 0x5A }
-        finally { $stream.Dispose() }
+      Assert-AgyUnlinkedPath $Path
+      # Content is sampled without excluding updater writes for a long hash.
+      # Size/timestamps alone can stay unchanged throughout an in-place update.
+      $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+      try {
+        if ($stream.Length -lt 10MB -or $stream.ReadByte() -ne 0x4D -or $stream.ReadByte() -ne 0x5A) { return $false }
+        $stream.Position = 0
+        $hash = [Security.Cryptography.SHA256]::Create()
+        try { $digest = [BitConverter]::ToString($hash.ComputeHash($stream)).Replace('-', '') } finally { $hash.Dispose() }
+      } finally { $stream.Dispose() }
+      if ($digest -ceq $previous) {
+        # A short exclusive probe rejects a writer holding its file open. The
+        # staged snapshot and displaced-file validation bind this sample later.
+        $probe = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+        try { if ($probe.Length -lt 10MB) { return $false } } finally { $probe.Dispose() }
+        if ($null -ne $ReadyHash) { $ReadyHash.Value = $digest }
+        return $true
       }
-      $previous = $stamp
+      $previous = $digest
     } catch { return $false }
-    Start-Sleep -Seconds 2
+    Start-Sleep -Milliseconds 500
   }
   return $false
 }
 
+function New-AgyOriginalSnapshot {
+  param($Transaction, [string]$Source, [string]$Destination, [switch]$ValidateUpdate)
+  Assert-AgyUnlinkedPath $Source
+  Assert-AgyRegularFile $Source
+  $stage = Get-AgyUniquePath $Destination
+  $Transaction.Temps.Add($stage)
+  $input = [IO.File]::Open($Source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+  try {
+    if ($ValidateUpdate) {
+      if ($input.Length -lt 10MB -or $input.ReadByte() -ne 0x4D -or $input.ReadByte() -ne 0x5A) {
+        throw "The replacement executable is not a complete PE candidate: $Source"
+      }
+      $input.Position = 0
+    }
+    $output = [IO.File]::Open($stage, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $input.CopyTo($output); $output.Flush($true) } finally { $output.Dispose() }
+  } finally { $input.Dispose() }
+  return [pscustomobject]@{ Path = $stage; Hash = (Get-FileHash -LiteralPath $stage -Algorithm SHA256).Hash }
+}
+
 function Set-AgyNativeFiles {
   param($Transaction, $State, [string]$Template, $Config, [switch]$ReplaceOriginal)
+  Assert-AgyUnlinkedPath $State.shimPath
+  if ($State.mode -eq 'inplace') { Assert-AgyUnlinkedPath $State.target }
   $configPath = Join-Path (Split-Path -Parent $State.shimPath) 'agy-launcher.json'
   if ($ReplaceOriginal) {
-    $realStage = New-AgyStagedCopy $Transaction $State.shimPath $State.target
-    Set-AgyTransactionFile $Transaction $State.target $realStage
+    $snapshot = New-AgyOriginalSnapshot $Transaction $State.shimPath $State.target -ValidateUpdate:([bool]$State.PSObject.Properties['validateUpdate'])
+    if ($State.PSObject.Properties['expectedUpdateHash'] -and $State.expectedUpdateHash -cne $snapshot.Hash) {
+      throw "The replacement executable changed after its quiet check; it was left untouched: $($State.shimPath)"
+    }
+    $Transaction.ExpectedHashes[$State.shimPath] = $snapshot.Hash
+    Set-AgyTransactionFile $Transaction $State.target $snapshot.Path
   }
-  $configStage = New-AgyStagedJson $Transaction $configPath $Config
-  Set-AgyTransactionFile $Transaction $configPath $configStage
+  $sameConfig = $false
+  if ([IO.File]::Exists($configPath)) {
+    $existing = Read-AgyLauncherConfig $configPath
+    $sameConfig = (Test-AgySamePath $existing.target $Config.target) -and $existing.kind -ceq $Config.kind -and
+      $existing.port -eq $Config.port -and (Test-AgySamePath $existing.certificate $Config.certificate)
+  }
+  if (-not $sameConfig) {
+    $configStage = New-AgyStagedJson $Transaction $configPath $Config
+    Set-AgyTransactionFile $Transaction $configPath $configStage
+  }
   $sameBinary = (Test-AgyNativeShim $State.shimPath) -and ((Get-FileHash -LiteralPath $State.shimPath -Algorithm SHA256).Hash -ceq (Get-FileHash -LiteralPath $Template -Algorithm SHA256).Hash)
   if (-not $sameBinary) {
     $shimStage = New-AgyStagedCopy $Transaction $Template $State.shimPath
@@ -699,8 +816,11 @@ function Install-AgyWindowsShim {
       $replaceOriginal = $false
       if ($state.mode -eq 'inplace') {
         if ([IO.File]::Exists($state.shimPath) -and -not (Test-AgyNativeShim $state.shimPath)) {
-          if ((($savedState -and -not $previousState) -or $legacy) -and -not (Test-AgyStableUpdate $state.shimPath)) {
-            throw "The replacement agy.exe is incomplete or suspicious; it was left untouched: $($state.shimPath)"
+          if (($savedState -and -not $previousState) -or $legacy) {
+            $readyHash = $null
+            if (-not (Test-AgyStableUpdate $state.shimPath -ReadyHash ([ref]$readyHash))) { throw "The replacement agy.exe is incomplete or suspicious; it was left untouched: $($state.shimPath)" }
+            $state | Add-Member -NotePropertyName validateUpdate -NotePropertyValue $true -Force
+            $state | Add-Member -NotePropertyName expectedUpdateHash -NotePropertyValue $readyHash -Force
           }
           $replaceOriginal = $true
         } elseif (-not [IO.File]::Exists($state.target)) { throw "The original agy executable is missing: $($state.target)" }
@@ -713,12 +833,13 @@ function Install-AgyWindowsShim {
         if (-not (Test-AgyPathContains $oldUserPath $state.pathEntry)) { $state.pathAdded = $true }
         if (-not (Test-AgyPathContains $oldProcessPath $state.pathEntry)) { $state | Add-Member -NotePropertyName processPathAdded -NotePropertyValue $true -Force }
       }
+      $config = [ordered]@{ version = 1; target = $state.target; kind = $state.kind; port = $Port; certificate = $Certificate }
+      $state | Add-Member -NotePropertyName recoveryConfig -NotePropertyValue $config -Force
       # Recovery metadata must exist before any original executable or user PATH changes.
       $statePath = Join-Path $root 'shim-state.json'
       $stateStage = New-AgyStagedJson $transaction $statePath $state
       Set-AgyTransactionFile $transaction $statePath $stateStage
       if ($state.mode -eq 'overlay') { $pathChanged = $true; Add-AgyOverlayPath $state }
-      $config = [ordered]@{ version = 1; target = $state.target; kind = $state.kind; port = $Port; certificate = $Certificate }
       Set-AgyNativeFiles $transaction $state $nativeTemplate $config -ReplaceOriginal:$replaceOriginal
       if ($previousState -and -not $reuseShim) {
         # Retire the old wrapper only after the new CLI and its config are ready.
@@ -757,35 +878,58 @@ function Install-AgyWindowsShim {
 }
 
 function Repair-AgyWindowsShim {
-  param([Parameter(Mandatory = $true)][string]$Prefix)
+  param([Parameter(Mandatory = $true)][string]$Prefix, [switch]$Watcher)
   Invoke-AgyShimLock $Prefix {
     param($root)
     $state = Read-AgyShimState $root
-    if (-not $state) { return }
+    if (-not $state) { if ($Watcher) { return 'Blocked' }; return }
+    Assert-AgyUnlinkedPath $state.shimPath
+    if ($state.mode -eq 'inplace') { Assert-AgyUnlinkedPath $state.target }
     $template = Join-Path $root 'agy.exe.tpl'
+    Assert-AgyUnlinkedPath $template
     if (-not (Test-AgyNativeShim $template)) { throw "The native launcher template is missing or invalid: $template" }
     $configPath = Assert-AgyOwnedConfig $state
-    if (-not [IO.File]::Exists($configPath)) { throw "Launcher configuration is missing; run the installer again: $configPath" }
-    $config = Read-AgyLauncherConfig $configPath
-    if (Test-AgyNativeShim $state.shimPath) { return }
+    $configMissing = -not [IO.File]::Exists($configPath)
+    if ($configMissing) {
+      # Old installations have no trusted metadata: never guess a port or target.
+      if (-not $state.PSObject.Properties['recoveryConfig']) { throw "Launcher configuration is missing; run the installer again: $configPath" }
+      $config = $state.recoveryConfig
+      if ($config.version -ne 1 -or $config.kind -cne $state.kind -or -not (Test-AgySamePath $config.target $state.target) -or
+          ($config.port -isnot [int] -and $config.port -isnot [long]) -or $config.port -lt 1 -or $config.port -gt 65535 -or
+          -not [IO.Path]::IsPathRooted($config.certificate)) { throw 'The trusted recovery configuration is invalid; run the installer again.' }
+    } else { $config = Read-AgyLauncherConfig $configPath }
+    if ((Test-AgyNativeShim $state.shimPath) -and -not $configMissing) {
+      if (-not [IO.File]::Exists($state.target)) { if ($Watcher) { return 'Pending' }; throw "The original launcher target is missing: $($state.target)" }
+      if ($state.mode -eq 'inplace' -and (Test-AgyNativeShim $state.target)) { throw "The saved original is itself a native shim: $($state.target)" }
+      if ($Watcher) { return 'Healthy' }; return
+    }
     $replaceOriginal = $false
+    if (-not [IO.Directory]::Exists((Split-Path -Parent $state.shimPath))) { if ($Watcher) { return 'Pending' }; return }
     if ($state.mode -eq 'overlay') {
-      if ([IO.File]::Exists($state.shimPath)) {
+      if ([IO.File]::Exists($state.shimPath) -and -not (Test-AgyNativeShim $state.shimPath)) {
         Write-AgyHealLog $root "foreign overlay executable left untouched: $($state.shimPath)"
-        return
+        if ($Watcher) { return 'Blocked' }; return
       }
-      if (-not [IO.File]::Exists($state.target)) {
-        Write-AgyHealLog $root "managed launcher is missing; wrapper left untouched: $($state.target)"
-        return
-      }
+      if (-not [IO.File]::Exists($state.target)) { if ($Watcher) { return 'Pending' }; return }
     } else {
-      if (-not [IO.File]::Exists($state.target) -or (Test-AgyNativeShim $state.target)) { throw "The saved original executable is missing or invalid: $($state.target)" }
-      if ([IO.File]::Exists($state.shimPath)) {
-        if (-not (Test-AgyStableUpdate $state.shimPath)) {
+      if ([IO.File]::Exists($state.shimPath) -and -not (Test-AgyNativeShim $state.shimPath)) {
+        $readyHash = $null
+        if (-not (Test-AgyStableUpdate $state.shimPath -ReadyHash ([ref]$readyHash))) {
           Write-AgyHealLog $root "suspicious or unstable agy.exe (not MZ or <10MB) left untouched: $($state.shimPath)"
-          return
+          if ($Watcher) { return 'Pending' }; return
         }
         $replaceOriginal = $true
+        $state | Add-Member -NotePropertyName validateUpdate -NotePropertyValue $true -Force
+        $state | Add-Member -NotePropertyName expectedUpdateHash -NotePropertyValue $readyHash -Force
+      } else {
+        if (-not [IO.File]::Exists($state.target) -or (Test-AgyNativeShim $state.target)) { throw "The saved original executable is missing or invalid: $($state.target)" }
+        if (-not [IO.File]::Exists($state.shimPath)) {
+          if ($Watcher) { return 'Pending' }
+          # A deletion is not updater completion. Only the manual/five-minute
+          # fallback restores a path still absent after a separate quiet period.
+          Start-Sleep -Milliseconds 500
+          if ([IO.File]::Exists($state.shimPath)) { return }
+        }
       }
     }
     $transaction = New-AgyTransaction
@@ -795,7 +939,128 @@ function Repair-AgyWindowsShim {
     } catch { $failure = $_; Undo-AgyTransaction $transaction; throw $failure }
     finally { Clear-AgyTransactionTemps $transaction }
     Write-AgyHealLog $root "restored native launcher: $($state.shimPath)"
+    if ($Watcher) { return 'Repaired' }
   }
+}
+
+function Get-AgyWatcherExecutable {
+  param([string]$Prefix, [string]$SourcePath)
+  Assert-AgyUnlinkedPath $Prefix
+  Assert-AgyUnlinkedPath $SourcePath
+  $destination = Join-Path $Prefix 'agy-watcher.exe'
+  Assert-AgyUnlinkedPath $destination
+  if ([IO.File]::Exists($destination) -and [Diagnostics.FileVersionInfo]::GetVersionInfo($destination).FileDescription -cne 'agy-region-fixer-watcher-v1') {
+    throw "Refusing to replace a foreign watcher executable: $destination"
+  }
+  $compiler = $null
+  foreach ($framework in @('Framework64', 'Framework')) {
+    $candidate = Join-Path $env:WINDIR "Microsoft.NET\$framework\v4.0.30319\csc.exe"
+    if ([IO.File]::Exists($candidate)) { $compiler = $candidate; break }
+  }
+  if (-not $compiler) { throw 'The Windows .NET Framework C# compiler was not found.' }
+  $stage = Get-AgyUniquePath $destination
+  $start = New-Object Diagnostics.ProcessStartInfo
+  $start.FileName = $compiler
+  $start.Arguments = '/nologo /target:winexe /optimize+ /platform:anycpu /out:"' + $stage + '" "' + $SourcePath + '"'
+  $start.UseShellExecute = $false
+  $start.CreateNoWindow = $true
+  $start.RedirectStandardOutput = $true
+  $start.RedirectStandardError = $true
+  $process = New-Object Diagnostics.Process
+  $process.StartInfo = $start
+  $started = $false
+  try {
+    $started = $process.Start()
+    if (-not $started) { throw 'The watcher compiler did not start.' }
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit(30000)) { throw 'Watcher compilation timed out after 30 seconds.' }
+    if (-not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdout, $stderr), 5000)) { throw 'Timed out collecting watcher compiler output.' }
+    if ($process.ExitCode -ne 0) { throw "Watcher compilation failed: $($stdout.Result)$($stderr.Result)" }
+    if ([Diagnostics.FileVersionInfo]::GetVersionInfo($stage).FileDescription -cne 'agy-region-fixer-watcher-v1') { throw 'The compiled watcher has no ownership marker.' }
+    if ([IO.File]::Exists($destination)) { [IO.File]::Replace($stage, $destination, [NullString]::Value) }
+    else { [IO.File]::Move($stage, $destination) }
+  } finally {
+    try { if ($started -and -not $process.HasExited) { $process.Kill(); [void]$process.WaitForExit(5000) } }
+    finally { $process.Dispose(); if ([IO.File]::Exists($stage)) { [IO.File]::Delete($stage) } }
+  }
+  return $destination
+}
+
+function Stop-AgyWindowsWatcher {
+  param([string]$Prefix)
+  Assert-AgyUnlinkedPath $Prefix
+  $executable = Join-Path $Prefix 'agy-watcher.exe'
+  $disabled = Join-Path $Prefix 'watcher.disabled'
+  Assert-AgyUnlinkedPath $disabled
+  [IO.File]::WriteAllText($disabled, 'Disabled by installer or uninstaller.', (New-Object Text.UTF8Encoding($false)))
+  # Disable future starts before signaling. Never stop a running repair through
+  # Task Scheduler: it must release the shim transaction lock itself.
+  $task = Get-ScheduledTask -TaskName 'agy-region-fixer-watch' -ErrorAction SilentlyContinue
+  if ($task) {
+    if (@($task.Actions).Count -ne 1 -or -not (Test-AgySamePath $task.Actions[0].Execute $executable)) { throw 'The watcher task belongs to another executable; it was left untouched.' }
+    Disable-ScheduledTask -InputObject $task -ErrorAction Stop | Out-Null
+  }
+  $fallback = Get-ScheduledTask -TaskName 'agy-region-fixer-heal' -ErrorAction SilentlyContinue
+  if ($fallback) {
+    $expected = Join-Path $Prefix 'heal.ps1'
+    if ($fallback.Actions[0].Arguments -notmatch ('(?i)(?:"|\s)' + [regex]::Escape($expected) + '(?:"|\s|$)')) { throw 'The heal task belongs to another installation; it was left untouched.' }
+    Disable-ScheduledTask -InputObject $fallback -ErrorAction Stop | Out-Null
+  }
+  if (-not [IO.File]::Exists($executable)) { return }
+  Assert-AgyUnlinkedPath $executable
+  if ([Diagnostics.FileVersionInfo]::GetVersionInfo($executable).FileDescription -cne 'agy-region-fixer-watcher-v1') { throw "Refusing to signal a foreign watcher: $executable" }
+  $start = New-Object Diagnostics.ProcessStartInfo
+  $start.FileName = $executable
+  $start.Arguments = '--stop "' + $Prefix + '"'
+  $start.UseShellExecute = $false
+  $start.CreateNoWindow = $true
+  $process = [Diagnostics.Process]::Start($start)
+  try {
+    if (-not $process.WaitForExit(50000)) { throw 'Watcher stop control timed out; installation files were preserved.' }
+    if ($process.ExitCode -ne 0) { throw 'The watcher has not stopped; installation files were preserved.' }
+  } finally {
+    # This is the exact control child, never the watcher or a repair process.
+    if (-not $process.HasExited) { $process.Kill(); [void]$process.WaitForExit(5000) }
+    $process.Dispose()
+  }
+}
+
+function Start-AgyWindowsWatcher {
+  param([string]$Prefix, $State)
+  $executable = Join-Path $Prefix 'agy-watcher.exe'
+  Assert-AgyUnlinkedPath $executable
+  if ([Diagnostics.FileVersionInfo]::GetVersionInfo($executable).FileDescription -cne 'agy-region-fixer-watcher-v1') { throw "The watcher executable is not owned: $executable" }
+  $arguments = '--run "' + $Prefix + '" "' + $State.shimPath + '" "' + $State.target + '"'
+  $action = New-ScheduledTaskAction -Execute $executable -Argument $arguments
+  $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+  $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+  $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 3 -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+  Register-ScheduledTask -TaskName 'agy-region-fixer-watch' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+  $disabled = Join-Path $Prefix 'watcher.disabled'
+  Assert-AgyUnlinkedPath $disabled
+  if ([IO.File]::Exists($disabled)) { [IO.File]::Delete($disabled) }
+  Start-ScheduledTask -TaskName 'agy-region-fixer-watch' -ErrorAction Stop
+  # Status is a named-event readiness check; it does not poll the filesystem.
+  $deadline = [Diagnostics.Stopwatch]::StartNew()
+  do {
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = $executable
+    $start.Arguments = '--status "' + $Prefix + '"'
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $probe = [Diagnostics.Process]::Start($start)
+    try {
+      if (-not $probe.WaitForExit(2000)) { throw 'Watcher readiness control timed out.' }
+      if ($probe.ExitCode -eq 0) { return }
+    } finally {
+      if (-not $probe.HasExited) { $probe.Kill(); [void]$probe.WaitForExit(1000) }
+      $probe.Dispose()
+    }
+    Start-Sleep -Milliseconds 100
+  } while ($deadline.ElapsedMilliseconds -lt 15000)
+  throw "The watcher did not become ready; check $(Join-Path $Prefix 'watcher.log')."
 }
 
 function Remove-AgyWindowsShim {
@@ -1205,24 +1470,430 @@ internal static class Launcher
 '@
 
 # --- shim ------------------------------------------------------------------
+$windowsWatcherSource = @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.IO.MemoryMappedFiles;
+using System.Reflection;
+using System.Security.Cryptography;
+using System.Security.Principal;
+using System.Text;
+using System.Threading;
+
+[assembly: AssemblyDescription("agy-region-fixer-watcher-v1")]
+[assembly: AssemblyTitle("agy-region-fixer-watcher-v1")]
+[assembly: AssemblyVersion("1.0.0.0")]
+
+internal static class AgyWatcher
+{
+    private const int QuietMilliseconds = 500;
+    private const int ChildTimeoutMilliseconds = 20000;
+    private const int BurstMilliseconds = 45000;
+    private const int MaximumAttempts = 6;
+    private const int MaximumWatches = 64;
+    private const int OutputLimit = 4096;
+    private static readonly AutoResetEvent Changed = new AutoResetEvent(false);
+    private static int generation;
+    private static string prefix;
+    private static readonly List<FileSystemWatcher> subscriptions = new List<FileSystemWatcher>();
+    private static Dictionary<string, HashSet<string>> desired;
+
+    // Callbacks never touch disk or run PowerShell. The sole worker reconciles
+    // the latest state, including changes delivered while a repair is running.
+    private static void Dirty(object sender, FileSystemEventArgs args)
+    {
+        Interlocked.Increment(ref generation);
+        Changed.Set();
+    }
+    private static void Overflow(object sender, ErrorEventArgs args)
+    {
+        Interlocked.Increment(ref generation);
+        Changed.Set();
+    }
+    private static string FullPath(string path)
+    {
+        if (!Path.IsPathRooted(path)) throw new IOException("An absolute path is required: " + path);
+        return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    }
+    private static void AssertUnlinked(string path)
+    {
+        string current = FullPath(path);
+        while (!String.IsNullOrEmpty(current))
+        {
+            if ((File.Exists(current) || Directory.Exists(current)) &&
+                (File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Refusing a linked watcher path: " + current);
+            string parent = Path.GetDirectoryName(current);
+            if (String.Equals(parent, current, StringComparison.OrdinalIgnoreCase)) break;
+            current = parent;
+        }
+    }
+    private static string Identity()
+    {
+        string user = WindowsIdentity.GetCurrent().User.Value;
+        using (SHA256 hash = SHA256.Create())
+            return "Local\\AgyRegionWatcher-" + BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(user + "\n" + prefix.ToUpperInvariant()))).Replace("-", "");
+    }
+    private static void AddLogicalPath(string path)
+    {
+        string current = FullPath(path);
+        while (!String.IsNullOrEmpty(current))
+        {
+            string parent = Path.GetDirectoryName(current);
+            if (String.IsNullOrEmpty(parent) || String.Equals(parent, current, StringComparison.OrdinalIgnoreCase)) break;
+            HashSet<string> names;
+            if (!desired.TryGetValue(parent, out names))
+            {
+                if (desired.Count >= MaximumWatches) throw new IOException("Watcher path depth exceeds its bounded subscription limit.");
+                names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                desired.Add(parent, names);
+            }
+            names.Add(Path.GetFileName(current));
+            current = parent;
+        }
+    }
+    private static void RefreshSubscriptions()
+    {
+        // Install new subscriptions before retiring old ones. Watching each
+        // ancestor's next component notices directory replacement at logical paths.
+        var next = new List<FileSystemWatcher>();
+        try
+        {
+            foreach (var pair in desired)
+            {
+                if (!Directory.Exists(pair.Key)) continue;
+                // Source directories may be package-manager junctions. These
+                // subscriptions only observe; writable paths are checked by heal.
+                var names = pair.Value;
+                var watcher = new FileSystemWatcher(pair.Key);
+                next.Add(watcher);
+                watcher.IncludeSubdirectories = false;
+                watcher.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size;
+                watcher.InternalBufferSize = 8192;
+                FileSystemEventHandler onChange = delegate(object sender, FileSystemEventArgs args) {
+                    if (names.Contains(args.Name)) Dirty(sender, args);
+                };
+                watcher.Changed += onChange;
+                watcher.Created += onChange;
+                watcher.Deleted += onChange;
+                watcher.Renamed += delegate(object sender, RenamedEventArgs args) {
+                    if (names.Contains(args.Name) || names.Contains(args.OldName)) Dirty(sender, args);
+                };
+                watcher.Error += Overflow;
+                watcher.EnableRaisingEvents = true;
+            }
+        }
+        catch
+        {
+            foreach (var watcher in next) watcher.Dispose();
+            throw;
+        }
+        foreach (var watcher in subscriptions) watcher.Dispose();
+        subscriptions.Clear();
+        subscriptions.AddRange(next);
+    }
+    private static string Quote(string value)
+    {
+        // Windows CRT quoting, also used when the profile contains spaces.
+        var result = new StringBuilder("\"");
+        int slashes = 0;
+        foreach (char character in value)
+        {
+            if (character == '\\') { slashes++; continue; }
+            result.Append('\\', character == '"' ? slashes * 2 + 1 : slashes);
+            result.Append(character);
+            slashes = 0;
+        }
+        result.Append('\\', slashes * 2);
+        return result.Append('"').ToString();
+    }
+    private sealed class BoundedOutput
+    {
+        private readonly StringBuilder tail = new StringBuilder();
+        internal void Drain(StreamReader reader)
+        {
+            try
+            {
+                var buffer = new char[1024];
+                int count;
+                while ((count = reader.Read(buffer, 0, buffer.Length)) != 0)
+                {
+                    lock (tail)
+                    {
+                        tail.Append(buffer, 0, count);
+                        if (tail.Length > OutputLimit) tail.Remove(0, tail.Length - OutputLimit);
+                    }
+                }
+            }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
+        }
+        public override string ToString() { lock (tail) return tail.ToString(); }
+    }
+    private static void Log(string message)
+    {
+        string path = Path.Combine(prefix, "watcher.log");
+        AssertUnlinked(path);
+        if (File.Exists(path) && new FileInfo(path).Length > 131072) File.Delete(path);
+        File.AppendAllText(path, DateTime.UtcNow.ToString("o") + " " + message + Environment.NewLine, new UTF8Encoding(false));
+    }
+    private static int Reconcile(int remainingMilliseconds)
+    {
+        AssertUnlinked(prefix);
+        string heal = Path.Combine(prefix, "heal.ps1");
+        AssertUnlinked(heal);
+        if (!File.Exists(heal)) throw new IOException("The owned heal script is missing: " + heal);
+        var start = new ProcessStartInfo();
+        start.FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell\\v1.0\\powershell.exe");
+        start.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + Quote(heal) + " -Watcher";
+        start.UseShellExecute = false;
+        start.CreateNoWindow = true;
+        start.RedirectStandardOutput = true;
+        start.RedirectStandardError = true;
+        using (var process = new Process())
+        {
+            process.StartInfo = start;
+            if (!process.Start()) throw new IOException("The owned heal process did not start.");
+            var output = new BoundedOutput();
+            var stdout = new Thread(delegate() { output.Drain(process.StandardOutput); });
+            var stderr = new Thread(delegate() { output.Drain(process.StandardError); });
+            stdout.IsBackground = true;
+            stderr.IsBackground = true;
+            stdout.Start();
+            stderr.Start();
+            try
+            {
+                if (!process.WaitForExit(Math.Max(1, Math.Min(ChildTimeoutMilliseconds, remainingMilliseconds))))
+                {
+                    process.Kill();
+                    if (!process.WaitForExit(5000)) throw new IOException("The timed-out heal process could not be stopped.");
+                    throw new IOException("The owned heal process timed out.");
+                }
+                if (!stdout.Join(2000) || !stderr.Join(2000)) throw new IOException("Timed out collecting bounded heal output.");
+                int result = process.ExitCode;
+                if (result != 0 && result != 10 && result != 20 && result != 21)
+                    throw new IOException("Heal failed (" + result + "): " + output.ToString());
+                return result;
+            }
+            finally
+            {
+                if (!process.HasExited) { process.Kill(); process.WaitForExit(5000); }
+                process.StandardOutput.Close();
+                process.StandardError.Close();
+                stdout.Join(2000);
+                stderr.Join(2000);
+            }
+        }
+    }
+    private static bool WaitForQuiet(EventWaitHandle stop, Stopwatch burst)
+    {
+        while (burst.ElapsedMilliseconds < BurstMilliseconds)
+        {
+            int before = Volatile.Read(ref generation);
+            int signaled = WaitHandle.WaitAny(new WaitHandle[] { stop, Changed }, QuietMilliseconds);
+            if (signaled == 0) return false;
+            if (signaled == WaitHandle.WaitTimeout && before == Volatile.Read(ref generation)) return true;
+        }
+        return true;
+    }
+    private static int Run(string[] args, string identity)
+    {
+        if (args.Length != 4) throw new ArgumentException("Usage: agy-watcher.exe --run PREFIX SHIM TARGET");
+        string disabled = Path.Combine(prefix, "watcher.disabled");
+        AssertUnlinked(disabled);
+        if (File.Exists(disabled)) return 0;
+        desired = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        AssertUnlinked(args[2]);
+        foreach (string path in new[] { args[2], args[3], Path.Combine(Path.GetDirectoryName(FullPath(args[2])), "agy-launcher.json"), Path.Combine(prefix, "shim-state.json") })
+            AddLogicalPath(path);
+        using (var mutex = new Mutex(false, identity + "-owner"))
+        {
+            bool owned;
+            try { owned = mutex.WaitOne(0); } catch (AbandonedMutexException) { owned = true; }
+            if (!owned) return 0;
+            try
+            {
+                using (var owner = MemoryMappedFile.CreateOrOpen(identity + "-process", 16))
+                using (var record = owner.CreateViewAccessor())
+                using (var current = Process.GetCurrentProcess())
+                using (var stop = new EventWaitHandle(false, EventResetMode.ManualReset, identity + "-stop"))
+                using (var ready = new EventWaitHandle(false, EventResetMode.ManualReset, identity + "-ready"))
+                {
+                    record.Write(0, 0);
+                    record.Write(8, current.StartTime.ToUniversalTime().Ticks);
+                    record.Write(0, current.Id);
+                    ready.Reset();
+                    if (File.Exists(disabled) || stop.WaitOne(0)) return 0;
+                    RefreshSubscriptions(); // Subscribe before the initial reconciliation.
+                    Changed.Set();
+                    while (WaitHandle.WaitAny(new WaitHandle[] { stop, Changed }) != 0)
+                    {
+                        var burst = Stopwatch.StartNew();
+                        int result = 20;
+                        for (int attempt = 0; attempt < MaximumAttempts && burst.ElapsedMilliseconds < BurstMilliseconds; attempt++)
+                        {
+                            if (!WaitForQuiet(stop, burst)) return 0;
+                            if (burst.ElapsedMilliseconds >= BurstMilliseconds) { result = 20; break; }
+                            RefreshSubscriptions();
+                            int observed = Volatile.Read(ref generation);
+                            result = Reconcile(BurstMilliseconds - (int)burst.ElapsedMilliseconds);
+                            ready.Set();
+                            if (stop.WaitOne(0)) return 0;
+                            if (result == 21) break;
+                            if (result != 20 && observed == Volatile.Read(ref generation)) break;
+                            if (stop.WaitOne(1000)) return 0;
+                        }
+                        if (result == 20 || result == 21) Log(result == 20 ? "Pending; awaiting a filesystem event or the five-minute fallback." : "Blocked; awaiting a filesystem event or manual recovery.");
+                        // Exhausted work does not create an idle polling timer.
+                        // A newly delivered event remains signaled for the next burst.
+                    }
+                    return 0;
+                }
+            }
+            finally
+            {
+                foreach (var watcher in subscriptions) watcher.Dispose();
+                subscriptions.Clear();
+                mutex.ReleaseMutex();
+            }
+        }
+    }
+    private static Process ReadOwnerProcess(string identity)
+    {
+        // This immutable record belongs to the mutex owner. A process handle and
+        // start time prevent PID reuse from selecting another application.
+        for (int attempt = 0; attempt < 50; attempt++)
+        {
+            try
+            {
+                using (var owner = MemoryMappedFile.OpenExisting(identity + "-process", MemoryMappedFileRights.Read))
+                using (var record = owner.CreateViewAccessor(0, 16, MemoryMappedFileAccess.Read))
+                {
+                    int pid = record.ReadInt32(0);
+                    long started = record.ReadInt64(8);
+                    if (pid > 0)
+                    {
+                        Process process;
+                        try { process = Process.GetProcessById(pid); }
+                        catch (ArgumentException) { return null; }
+                        try
+                        {
+                            // Open and retain the kernel handle before signaling.
+                            IntPtr handle = process.Handle;
+                            if (process.StartTime.ToUniversalTime().Ticks != started ||
+                                !String.Equals(FullPath(process.MainModule.FileName), FullPath(Assembly.GetExecutingAssembly().Location), StringComparison.OrdinalIgnoreCase))
+                                throw new IOException("The watcher owner record does not match its process.");
+                            return process;
+                        }
+                        catch (InvalidOperationException) { process.Dispose(); return null; }
+                        catch { process.Dispose(); throw; }
+                    }
+                }
+            }
+            catch (FileNotFoundException) { }
+            Thread.Sleep(20);
+        }
+        return null;
+    }
+    private static int Control(string mode, string identity)
+    {
+        if (mode == "--status")
+        {
+            try { using (var ready = EventWaitHandle.OpenExisting(identity + "-ready")) return ready.WaitOne(0) ? 0 : 1; }
+            catch (WaitHandleCannotBeOpenedException) { return 1; }
+        }
+        try
+        {
+            using (var mutex = Mutex.OpenExisting(identity + "-owner"))
+            using (var process = ReadOwnerProcess(identity))
+            {
+                if (process == null)
+                {
+                    bool inactive;
+                    try { inactive = mutex.WaitOne(0); } catch (AbandonedMutexException) { inactive = true; }
+                    if (!inactive) throw new IOException("The active watcher owner could not be identified; teardown was stopped.");
+                    mutex.ReleaseMutex();
+                    return 0;
+                }
+                var deadline = Stopwatch.StartNew();
+                using (var stop = new EventWaitHandle(false, EventResetMode.ManualReset, identity + "-stop"))
+                {
+                    stop.Set();
+                    bool owned;
+                    try { owned = mutex.WaitOne(BurstMilliseconds); } catch (AbandonedMutexException) { owned = true; }
+                    if (!owned) throw new IOException("The owned watcher did not finish its active repair within the stop deadline.");
+                    mutex.ReleaseMutex();
+                    if (process != null && !process.WaitForExit(Math.Max(1, BurstMilliseconds - (int)deadline.ElapsedMilliseconds)))
+                        throw new IOException("The owned watcher has not exited after releasing its repair lock.");
+                    return 0;
+                }
+            }
+        }
+        catch (WaitHandleCannotBeOpenedException) { return 0; }
+    }
+    private static int Main(string[] args)
+    {
+        try
+        {
+            if (args.Length < 2 || (args[0] != "--run" && args[0] != "--stop" && args[0] != "--status"))
+                throw new ArgumentException("Usage: agy-watcher.exe --run PREFIX SHIM TARGET | --stop PREFIX | --status PREFIX");
+            prefix = FullPath(args[1]);
+            string executable = FullPath(Assembly.GetExecutingAssembly().Location);
+            if (!String.Equals(executable, FullPath(Path.Combine(prefix, "agy-watcher.exe")), StringComparison.OrdinalIgnoreCase))
+                throw new IOException("Watcher executable does not belong to this installation prefix.");
+            AssertUnlinked(prefix);
+            string identity = Identity();
+            return args[0] == "--run" ? Run(args, identity) : Control(args[0], identity);
+        }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine("[watcher] " + error.Message);
+            try { if (prefix != null) Log(error.Message); } catch (IOException) { }
+            return 1;
+        }
+    }
+}
+'@
 Say "4/6 Native EXE shim for agy (automatic format detection)"
 $supportPath = Join-Path $PREFIX "windows-support.ps1"
 $launcherSourcePath = Join-Path $PREFIX "windows-launcher.cs"
+# Load the new lifecycle helpers before touching files a previous watcher uses.
+. ([scriptblock]::Create($windowsSupportSource))
+Stop-AgyWindowsWatcher -Prefix $PREFIX
 WriteBom $supportPath $windowsSupportSource
 WriteNoBom $launcherSourcePath $windowsLauncherSource
-. $supportPath
+$watcherSourcePath = Join-Path $PREFIX 'windows-watcher.cs'
+WriteNoBom $watcherSourcePath $windowsWatcherSource
+$watcherExecutable = Get-AgyWatcherExecutable -Prefix $PREFIX -SourcePath $watcherSourcePath
 $shimState = Install-AgyWindowsShim -Prefix $PREFIX -Port $PORT -Certificate $ca -SourcePath $launcherSourcePath
 if ($shimState) { Say "native shim installed: $($shimState.shimPath) -> $($shimState.target)" }
 
 # --- heal ------------------------------------------------------------------
-Say "5/6 Shim self-healing (task every 5 minutes)"
+Say "5/6 Shim self-healing (filesystem events + task every 5 minutes)"
 $healPs1 = @'
+param([switch]$Watcher)
 $ErrorActionPreference = "Stop"
 $PREFIX = '@PREFIX@'
 try {
   . (Join-Path $PREFIX "windows-support.ps1")
+  if ($Watcher) {
+    $result = Repair-AgyWindowsShim -Prefix $PREFIX -Watcher
+    switch ($result) {
+      'Healthy' { exit 0 }
+      'Repaired' { exit 10 }
+      'Pending' { exit 20 }
+      'Blocked' { exit 21 }
+      default { throw "Unexpected watcher repair result: $result" }
+    }
+  }
   Repair-AgyWindowsShim -Prefix $PREFIX
 } catch {
+  if ($Watcher) {
+    [Console]::Error.WriteLine("[heal] " + $_.Exception.Message)
+    exit 21
+  }
   Add-Content -LiteralPath (Join-Path $PREFIX "mitm.log") -Value "[heal] $_" -Encoding UTF8
   exit 1
 }
@@ -1243,17 +1914,23 @@ if ($schtasksProc.ExitCode -ne 0) {
 # --- uninstall -------------------------------------------------------------
 Say "6/6 Uninstall script"
 $unPs1 = @'
-$ErrorActionPreference = "Continue"
+$ErrorActionPreference = "Stop"
 $PREFIX = '@PREFIX@'
+try {
+  . (Join-Path $PREFIX "windows-support.ps1")
+  Stop-AgyWindowsWatcher -Prefix $PREFIX
+} catch {
+  Write-Error "Could not stop self-healing; installation files were preserved: $_"
+  exit 1
+}
 Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "agy-region-fixer" -ErrorAction SilentlyContinue
-schtasks /Delete /F /TN "agy-region-fixer-heal" 2>$null
+foreach ($taskName in @('agy-region-fixer-watch', 'agy-region-fixer-heal')) {
+  $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+  if ($task) { Unregister-ScheduledTask -InputObject $task -Confirm:$false -ErrorAction Stop }
+}
 $venvMitm = Join-Path $PREFIX "venv\Scripts\mitmdump.exe"
-Get-CimInstance Win32_Process -Filter "Name='mitmdump.exe'" -OperationTimeoutSec 5 -ErrorAction SilentlyContinue |
-  Where-Object { $_.ExecutablePath -eq $venvMitm } |
-  ForEach-Object {
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-    Wait-Process -Id $_.ProcessId -Timeout 5 -ErrorAction SilentlyContinue
-  }
+# @STOP_PROXY@
+Stop-OurProxy
 try {
   . (Join-Path $PREFIX "windows-support.ps1")
   Remove-AgyWindowsShim -Prefix $PREFIX
@@ -1270,8 +1947,11 @@ try {
 }
 Write-Host "Fully removed."
 '@
-$unPs1 = $unPs1.Replace("@PREFIX@", $PREFIX.Replace("'", "''"))
+$unPs1 = $unPs1.Replace("@PREFIX@", $PREFIX.Replace("'", "''")).Replace("# @STOP_PROXY@", ("function Stop-OurProxy {`r`n" + ${function:Stop-OurProxy}.ToString() + "`r`n}"))
 WriteBom (Join-Path $PREFIX "uninstall.ps1") $unPs1
+
+# Registration can be denied by local task policy; recovery must already exist.
+Start-AgyWindowsWatcher -Prefix $PREFIX -State $shimState
 
 # --- smoke -----------------------------------------------------------------
 # hard 120 s limit: the process is started separately and the whole tree is killed on timeout

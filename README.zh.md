@@ -26,11 +26,11 @@ Google 会根据账号所在国家限制访问。本地 MITM 代理会从 `loadC
 
 | 特性 | 说明 |
 |---|---|
-| 🧩 **无需打补丁** | `agy` 保持原样，以 `agy.real` 的名字放在 shim 旁边 —— CLI 更新不会出问题 |
-| ⚡ **即时自愈** | 更新后 shim 会在数秒内恢复（Linux/macOS），Windows 最多 5 分钟 |
-| 🛡️ **安全的 heal** | 在 Linux 上以文件所有者身份运行，而不是 root；写到一半的更新不会被覆盖 |
+| 🧩 **无需打补丁** | `agy` 保持原样，以 `agy.real` 的名字放在 shim 旁边 |
+| ⚡ **事件触发自愈** | 文件系统事件触发修复，并保留五分钟备用检查 |
+| 🛡️ **修复保护** | Linux 上对用户可写目录中的目标降低运行权限；就绪检查和锁降低更新竞争风险 |
 | 🔒 **仅限本机** | 代理只监听 `127.0.0.1`；只清理 `*.googleapis.com` 的响应 |
-| 🧪 **CI 验证** | 在真实的 Linux / macOS / Windows 上跑完整流程：安装 → 更新 → 自愈 → 卸载 |
+| 🧪 **跨平台 CI** | Linux / macOS / Windows 生命周期工作流：安装 → 更新 → 自愈 → 卸载 |
 | 🧹 **干净卸载** | `uninstall` 会还原二进制文件并删除其余所有内容 |
 
 ## 🎯 修复什么
@@ -112,40 +112,31 @@ flowchart LR
 
 ## 🩹 CLI 更新后的自愈
 
-无需任何操作：CLI 更新程序会覆盖 shim，恢复程序会把它放回来。
+CLI 更新后，文件系统事件会触发 shim 修复。所有平台都保留每五分钟一次的备用检查；不会常驻循环每秒轮询 CLI 文件。
 
-```mermaid
-flowchart LR
-    A["⬆️ CLI 更新<br/>覆盖了 shim"] --> T{"⏱️ 触发"}
-    T -- "systemd path 单元" --> H
-    T -- "launchd WatchPaths" --> H
-    T -- "5 分钟定时器" --> H
-    H["🩹 heal.sh"] --> L["🔒 加锁"] --> C{"大小稳定<br/>且 ≥ 10 MB？"}
-    C -- 是 --> OK["✅ agy.real + 新 shim"]
-    C -- 否 --> SK["⏭️ 不处理，<br/>下次触发重试"]
-```
-
-| 系统 | 触发方式 | 延迟 |
+| 系统 | 事件触发方式 | 备用检查 |
 |---|---|---|
-| 🐧 Linux | systemd path 单元 + 定时器 | 数秒 |
-| 🍎 macOS | launchd `WatchPaths` + `StartInterval` | 数秒 |
-| 🪟 Windows | 计划任务 `agy-region-fixer-heal` | ≤ 5 分钟 |
+| 🐧 Linux | 使用 `PathChanged` 的 systemd path 单元 | systemd 定时器 |
+| 🍎 macOS | launchd `WatchPaths` | 独立的 `StartInterval` 任务 |
+| 🪟 Windows | .NET `FileSystemWatcher`，安装时及用户登录时启动 | 计划任务 `agy-region-fixer-heal` |
 
-替换前，heal 会等待文件停止增长（最多约 30 秒），并检查它像不像真正的二进制文件（≥ 10 MB；Windows 上还要检查 `MZ` 签名）。损坏或写到一半的文件不会被覆盖，只会记录日志。两个 heal 不会同时运行：工作在锁内进行，所以真正的二进制文件不会丢失。
+连续事件会先合并，再执行修复。恢复程序等待文件停止变化，并检查大小（≥ 10 MB；Windows 上还检查 `MZ` 签名）。锁、暂存副本和回滚检查用于降低竞争风险并保留先前可用的副本。这些只是就绪状态的间接判断：文件暂时稳定，并不能证明任意更新程序已完成更新。
 
-手动触发：
+如果更新程序先删除原位目标，再创建替代文件，事件触发的修复会保留 `Pending` 状态，避免在这个间隙放回 shim。如果文件一直没有出现，手动运行或五分钟备用检查会使用保存的二进制文件修复。受管理的启动器保持不变；只修复本工具自己的包装器。
+
+手动运行修复：
 
 - 🐧 `sudo agy-bypass-heal`
 - 🍎 `bash ~/.agy-region-fixer/heal.sh`
-- 🪟 等待 ≤ 5 分钟，或运行 `powershell %USERPROFILE%\.agy-region-fixer\heal.ps1`
+- 🪟 `powershell %USERPROFILE%\.agy-region-fixer\heal.ps1`
 
 ## 🔐 安全模型
 
 在 Linux 上 heal 由 root（systemd）启动，而存放 `agy` 的目录通常属于普通用户。为了防止用户借此以 root 身份写文件（被替换的符号链接、临时文件竞争），规则如下：
 
-- 👤 **所有针对二进制文件的操作都以其所有者身份执行**（`runuser`/`setpriv`）；root 只负责加锁和写日志
+- 👤 如果安装时记录的用户可写入目标目录，heal 会通过 `runuser`/`setpriv` 以该用户身份运行；只有原始路径和目标路径的目录都不允许该用户写入时，才可能由 root 处理
 - 🚫 如果只有 root 能写入目标目录，而 `agy` 的路径位于用户可控的目录中（例如指向系统文件的链接），heal 会**拒绝**执行，而不是以 root 身份操作
-- 🔑 不使用 `chown`：文件属主保持不变
+- 🔑 暂存的二进制副本保留原始所有者、所属组和普通权限位；以 root 运行时先执行 `fchown` 再恢复权限，带有 `setuid`/`setgid` 位的候选文件会在复制前被拒绝
 - 🧱 会校验 `AGY_BYPASS_PREFIX`：必须是绝对路径，不能是 `/` 或 `$HOME`，且不含 `\ " ' % $`
 - 🌐 代理只监听 `127.0.0.1`，密钥和令牌不会离开本机
 
@@ -187,7 +178,7 @@ $env:AGY_BYPASS_PORT="8081"; powershell -ExecutionPolicy Bypass -File install.ps
 
 🔬 详细模式下，插件还会记录 Google 每个 JSON 响应的**结构**（`SHAPE <方法> <url> <状态> -> {字段: 类型}`）：只记录字段名和类型，不记录值（`reasonCode`、`tierId` 等枚举除外）。如果安装后警告仍在，这些行可以显示 API 是否变化 —— 请把 `SHAPE` 行附在 issue 中。
 
-如果代理正在监听端口，但警告仍然存在，请检查安装目录中的 `addon.py` 是否存在，以及服务日志中是否出现 `Un-loading script`。在代理运行时删除安装目录会卸载插件，即使 HTTPS 流量仍能通过。重新运行安装脚本可恢复文件并重启代理；需要删除时请使用卸载脚本。
+代理通过 venv 中的 Python 直接运行 `addon.py`（`python -I addon.py --port PORT --confdir CA_DIR`），并只注册一次过滤钩子。它不使用 mitmdump 的脚本自动重载器，也不会每秒检查插件文件。修改 `addon.py` 后需要重启代理才会生效；重新运行安装脚本可恢复文件并重启代理。自定义 `AGY_ADDON_URL` 仍可提供仅包含 mitmproxy 钩子的插件：文件保存为 `custom-addon.py`，由标准启动程序通过 `--addon` 加载一次。修改该文件后也需要重启代理。需要移除安装时，请使用卸载脚本。
 
 ## ⚠️ 限制
 
@@ -197,11 +188,13 @@ $env:AGY_BYPASS_PORT="8081"; powershell -ExecutionPolicy Bypass -File install.ps
 
 ## ✅ 测试状态
 
-CI（GitHub Actions）在真实机器上跑完整生命周期：安装 → 代理 + CA + MITM 检查 → shim → 模拟 CLI 更新 → 自愈 → 竞争、被替换链接和符号链接攻击检查 → 还原二进制文件的干净卸载。
+GitHub Actions 工作流在各系统的原生运行器上检查生命周期：安装 → 代理 + CA + MITM 检查 → shim → 模拟 CLI 更新 → 自愈 → 竞争、被替换链接和符号链接攻击检查 → 还原二进制文件的干净卸载。
 
 | 🐧 ubuntu-latest | 🍎 macos-latest | 🪟 windows-latest |
 |:---:|:---:|:---:|
-| ✅ systemd | ✅ launchd | ✅ HKCU Run + schtasks |
+| systemd | launchd | HKCU Run + schtasks |
+
+事件触发修复和插件直接启动仍需在各系统上重新运行工作流；上表说明检查范围，不代表此版本已通过。
 
 CI 不测试真实的 `agy login` 和 Google 流量（使用假的 `agy`）；Linux 路径另外用真实 CLI 和模型做过实机验证（`BYPASS_OK`）。
 

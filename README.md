@@ -26,11 +26,11 @@ Google restricts access by the account's country. A local MITM proxy strips `ine
 
 | Feature | What it means |
 |---|---|
-| 🧩 **No patching** | `agy` stays untouched and sits next to the shim as `agy.real` — CLI updates break nothing |
-| ⚡ **Instant self-healing** | after an update the shim comes back in seconds (Linux/macOS) or within 5 minutes (Windows) |
-| 🛡️ **Safe heal** | on Linux it runs as the file's owner, not root; half-written updates are never clobbered |
+| 🧩 **No patching** | `agy` stays untouched and sits next to the shim as `agy.real` |
+| ⚡ **Event-triggered self-healing** | file-system events trigger repair; a five-minute fallback remains enabled |
+| 🛡️ **Guarded repair** | on Linux it drops privileges for user-writable targets; readiness checks and a lock reduce update races |
 | 🔒 **Localhost only** | the proxy listens on `127.0.0.1`; only `*.googleapis.com` responses are cleaned |
-| 🧪 **CI-tested** | full cycle on real Linux / macOS / Windows: install → update → heal → uninstall |
+| 🧪 **Cross-platform CI** | lifecycle workflow for Linux / macOS / Windows: install → update → heal → uninstall |
 | 🧹 **Clean uninstall** | `uninstall` puts the binary back and removes everything else |
 
 ## 🎯 What it fixes
@@ -112,40 +112,31 @@ flowchart LR
 
 ## 🩹 Self-healing after CLI updates
 
-Do nothing: the CLI updater overwrites the shim, the healer puts it back.
+File-system events trigger shim repair after a CLI update. A five-minute fallback remains enabled on every platform; no permanent loop polls the CLI file every second.
 
-```mermaid
-flowchart LR
-    A["⬆️ CLI update<br/>overwrote the shim"] --> T{"⏱️ trigger"}
-    T -- "systemd path unit" --> H
-    T -- "launchd WatchPaths" --> H
-    T -- "5-min timer" --> H
-    H["🩹 heal.sh"] --> L["🔒 lock"] --> C{"size stable<br/>and ≥ 10 MB?"}
-    C -- yes --> OK["✅ agy.real + new shim"]
-    C -- no --> SK["⏭️ leave as is,<br/>retry on next trigger"]
-```
-
-| OS | Trigger | Delay |
+| OS | Event trigger | Fallback |
 |---|---|---|
-| 🐧 Linux | systemd path unit + timer | seconds |
-| 🍎 macOS | launchd `WatchPaths` + `StartInterval` | seconds |
-| 🪟 Windows | scheduled task `agy-region-fixer-heal` | ≤ 5 minutes |
+| 🐧 Linux | systemd path unit with `PathChanged` | systemd timer |
+| 🍎 macOS | launchd `WatchPaths` | separate `StartInterval` job |
+| 🪟 Windows | .NET `FileSystemWatcher`, started at installation and user logon | scheduled task `agy-region-fixer-heal` |
 
-Before swapping, heal waits until the file stops growing (up to ~30 s) and checks that it looks like a real binary (≥ 10 MB; on Windows also the `MZ` signature). Broken or half-written files are left alone and only logged. Two heals never overlap: work happens under a lock, so the real binary cannot be lost.
+Events are coalesced before repair. The healer waits for a quiet candidate and checks its size (≥ 10 MB; on Windows also the `MZ` signature). It uses a lock, a staged copy and rollback checks to reduce races and preserve the previous working copy. These checks are a readiness heuristic: a quiet file does not prove that an arbitrary updater has finished.
 
-Force it manually:
+If an updater deletes an in-place target before creating its replacement, event-triggered repair leaves it `Pending` rather than restoring the shim into that gap. If the target stays missing, a manual run or the five-minute fallback repairs it from the saved binary. Managed launchers remain untouched; only this tool's wrapper is repaired.
+
+Run repair manually:
 
 - 🐧 `sudo agy-bypass-heal`
 - 🍎 `bash ~/.agy-region-fixer/heal.sh`
-- 🪟 wait ≤ 5 minutes or run `powershell %USERPROFILE%\.agy-region-fixer\heal.ps1`
+- 🪟 `powershell %USERPROFILE%\.agy-region-fixer\heal.ps1`
 
 ## 🔐 Security model
 
 On Linux heal is started by root (systemd) while the directory holding `agy` usually belongs to the user. So that the user cannot turn this into a root-level write (a planted symlink, a race on a temp file):
 
-- 👤 **all work on the binary runs as its owner** (`runuser`/`setpriv`); root only takes the lock and writes the log
+- 👤 when the recorded installation owner can write to the target directory, heal runs as that user (`runuser`/`setpriv`); root may handle paths whose entry and target directories are both outside that user’s write access
 - 🚫 if only root can write to the target directory while the `agy` path sits in a user-controlled one (e.g. a link to a system file), heal **refuses** instead of acting as root
-- 🔑 no `chown`: file ownership stays as it was
+- 🔑 staged binary copies preserve the original owner, group and ordinary permission bits; a root worker applies `fchown` before restoring the mode, and candidates with `setuid`/`setgid` bits are rejected before copying
 - 🧱 `AGY_BYPASS_PREFIX` is validated: absolute path, not `/` or `$HOME`, no `\ " ' % $` characters
 - 🌐 the proxy listens on `127.0.0.1` only; keys and tokens never leave the machine
 
@@ -187,7 +178,7 @@ Removes the proxy, tasks and shim; the `agy` binary goes back in place — even 
 
 🔬 In verbose mode the addon also logs the **shape** of every JSON answer from Google (`SHAPE <method> <url> <status> -> {field: type}`): field names and types only, never values (except enumerations such as `reasonCode` and `tierId`). If the warning stays after installing, this is what shows whether the API changed — attach the `SHAPE` lines to an issue.
 
-If the proxy is listening but the warning remains, check that `addon.py` still exists in the install directory and the service log has no `Un-loading script` entry. Deleting the directory while the proxy is running unloads the addon, even though HTTPS traffic still passes through. Rerun the installer to restore the files and restart the proxy; use the uninstall script when removing it.
+The proxy runs `addon.py` directly with the venv's Python (`python -I addon.py --port PORT --confdir CA_DIR`), registering the filtering hooks once. It does not use mitmdump's script autoreloader or poll the addon file every second. Changes to `addon.py` take effect after a proxy restart; rerunning the installer restores the files and restarts it. A custom `AGY_ADDON_URL` can still provide a hook-only mitmproxy addon: it is saved as `custom-addon.py` and loaded once by the standard bootstrap through `--addon`. Changes to that file also require a proxy restart. Use the uninstall script to remove the installation.
 
 ## ⚠️ Limitations
 
@@ -197,11 +188,13 @@ If the proxy is listening but the warning remains, check that `addon.py` still e
 
 ## ✅ Test status
 
-CI (GitHub Actions) runs the full lifecycle on live machines: install → proxy + CA + MITM check → shim → simulated CLI update → self-healing → race, planted-link and symlink-attack checks → clean uninstall that restores the binary.
+The GitHub Actions workflow covers the lifecycle on native runners: install → proxy + CA + MITM check → shim → simulated CLI update → self-healing → race, planted-link and symlink-attack checks → clean uninstall that restores the binary.
 
 | 🐧 ubuntu-latest | 🍎 macos-latest | 🪟 windows-latest |
 |:---:|:---:|:---:|
-| ✅ systemd | ✅ launchd | ✅ HKCU Run + schtasks |
+| systemd | launchd | HKCU Run + schtasks |
+
+Event-triggered repair and the direct addon bootstrap require a fresh native workflow run; the platform list above describes coverage, not a result for this revision.
 
 A real `agy login` and Google traffic are not tested in CI (fake `agy`); the Linux path was additionally verified live with the real CLI and model (`BYPASS_OK`).
 

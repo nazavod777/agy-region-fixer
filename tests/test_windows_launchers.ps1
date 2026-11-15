@@ -347,6 +347,91 @@ class LauncherFixture {
   Repair-AgyWindowsShim -Prefix $plain.Prefix | Out-Null
   Assert-True (Test-AgyNativeShim -Path $plainExe) "Heal did not restore native agy.exe"
   Assert-Equal (Get-Digest $state.target) $updateDigest "Heal did not retain the valid CLI update"
+  # Event-mode deletion stays pending until the updater recreates its path;
+  # healthy repeats are idempotent and do not rewrite the launcher config.
+  $configPath = Join-Path $plain.Bin "agy-launcher.json"
+  $configStamp = [IO.File]::GetLastWriteTimeUtc($configPath)
+  Assert-Equal (Repair-AgyWindowsShim -Prefix $plain.Prefix -Watcher) "Healthy" "Healthy machine result changed"
+  Assert-Equal ([IO.File]::GetLastWriteTimeUtc($configPath)) $configStamp "Healthy repair rewrote configuration"
+  [IO.File]::Delete($plainExe)
+  Assert-Equal (Repair-AgyWindowsShim -Prefix $plain.Prefix -Watcher) "Pending" "Deleted updater gap was not pending"
+  Assert-True (-not [IO.File]::Exists($plainExe)) "Event heal restored an old binary into an updater gap"
+  Repair-AgyWindowsShim -Prefix $plain.Prefix | Out-Null
+  Assert-True (Test-AgyNativeShim $plainExe) "Fallback did not restore a persistently missing shim"
+
+  # Trusted state can recreate a config removed with an updater's directory.
+  [IO.File]::Delete($configPath)
+  Assert-Equal (Repair-AgyWindowsShim -Prefix $plain.Prefix -Watcher) "Repaired" "Missing config did not recover from trusted state"
+  Assert-Configuration (Read-State $plain.Prefix) $changedPort "exe"
+
+  # An updater winning the race after snapshot creation must survive rollback,
+  # and the previous known-good agy.real.exe must remain unchanged.
+  Copy-PaddedFixture $plainExe 14MB
+  $beforeRaceOriginal = Get-Digest $state.target
+  $script:snapshotRaceHash = $null
+  $transactionWriterForRace = (Get-Command Set-AgyTransactionFile).ScriptBlock
+  & {
+    function Set-AgyTransactionFile {
+      param($Transaction, [string]$Path, [string]$Stage)
+      if ($Path -ieq $plainExe) {
+        Copy-PaddedFixture $plainExe 15MB
+        $script:snapshotRaceHash = Get-Digest $plainExe
+      }
+      & $transactionWriterForRace -Transaction $Transaction -Path $Path -Stage $Stage
+    }
+    Assert-Throws { Repair-AgyWindowsShim -Prefix $plain.Prefix -Watcher } "original changed during repair"
+  }
+  Assert-Equal (Get-Digest $plainExe) $script:snapshotRaceHash "Snapshot rollback lost the newer updater executable"
+  Assert-Equal (Get-Digest $state.target) $beforeRaceOriginal "Snapshot rollback damaged the known-good original"
+  [IO.File]::Copy((Join-Path $plain.Prefix "agy.exe.tpl"), $plainExe, $true)
+
+  # Timestamp restoration and a fixed size must not conceal active content
+  # writes. The positive control accepts the same PE once its writer stops.
+  Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Threading;
+public static class AgyReadinessMutator {
+    public static volatile bool Stop;
+    public static int Count;
+    public static Thread Start(string path) {
+        DateTime stamp = File.GetLastWriteTimeUtc(path);
+        var thread = new Thread(delegate() {
+            while (!Stop) {
+                try {
+                    using (var file = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete)) {
+                        file.Position = 128;
+                        file.WriteByte((byte)(Count % 251));
+                        file.Flush();
+                    }
+                    File.SetLastWriteTimeUtc(path, stamp);
+                    Interlocked.Increment(ref Count);
+                } catch (IOException) { }
+                Thread.Sleep(20);
+            }
+        });
+        thread.IsBackground = true;
+        thread.Start();
+        return thread;
+    }
+}
+'@
+  Copy-PaddedFixture $plainExe 16MB
+  $mutator = [AgyReadinessMutator]::Start($plainExe)
+  try {
+    $mutatorStartup = [Diagnostics.Stopwatch]::StartNew()
+    while ([AgyReadinessMutator]::Count -lt 3 -and $mutatorStartup.ElapsedMilliseconds -lt 2000) { Start-Sleep -Milliseconds 10 }
+    Assert-True ([AgyReadinessMutator]::Count -ge 3) "Readiness negative-control writer did not start"
+    $writesBefore = [AgyReadinessMutator]::Count
+    Assert-True (-not (Test-AgyStableUpdate $plainExe)) "Content writes with restored timestamps were accepted as stable"
+    Assert-True ($mutator.IsAlive -and [AgyReadinessMutator]::Count -gt $writesBefore) "Readiness negative-control writer did not keep running"
+  } finally {
+    [AgyReadinessMutator]::Stop = $true
+    Assert-True ($mutator.Join(2000)) "Readiness test writer did not stop"
+  }
+  Assert-True (Test-AgyStableUpdate $plainExe) "Readiness positive control rejected a quiescent PE"
+  [IO.File]::Copy((Join-Path $plain.Prefix "agy.exe.tpl"), $plainExe, $true)
+
   Write-Utf8 $plainExe "small junk"
   Repair-AgyWindowsShim -Prefix $plain.Prefix | Out-Null
   Assert-Equal ([IO.File]::ReadAllText($plainExe)) "small junk" "Heal clobbered an invalid update"

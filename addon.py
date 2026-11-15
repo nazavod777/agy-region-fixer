@@ -93,3 +93,92 @@ def response(flow: http.HTTPFlow):
     if changed:
         flow.response.set_text(json.dumps(data))
         _log(f"CLEANED {changed} in {flow.request.pretty_url}")
+
+
+def create_proxy(port, confdir, addon_path=None):
+    """Create the proxy inside a running event loop, without script reloading."""
+    from types import SimpleNamespace
+    from mitmproxy.options import Options
+    from mitmproxy.tools.dump import DumpMaster
+
+    options = Options(listen_host="127.0.0.1", listen_port=port, confdir=confdir)
+    master = DumpMaster(options, with_dumper=False)
+    # Scripts are installed as immutable process inputs. A service restart loads
+    # a new version; ScriptLoader's once-per-second stat loop is unnecessary.
+    loader = master.addons.get("scriptloader")
+    if loader is not None:
+        master.addons.remove(loader)
+    if addon_path is None:
+        filtering = SimpleNamespace(name="agy-region-fixer", request=request, response=response)
+    else:
+        # Preserve the ordinary mitmproxy script contract for AGY_ADDON_URL:
+        # module-level hooks and an optional addons list; no executable main.
+        import importlib.util
+        from pathlib import Path
+        import sys
+
+        path = Path(addon_path).resolve(strict=True)
+        spec = importlib.util.spec_from_file_location("agy_custom_addon", path)
+        filtering = importlib.util.module_from_spec(spec)
+        previous_path = sys.path
+        try:
+            sys.path = [str(path.parent), *sys.path]
+            spec.loader.exec_module(filtering)
+        finally:
+            sys.path = previous_path
+        if not hasattr(filtering, "name"):
+            filtering.name = "agy-custom-addon"
+    master.addons.add(filtering)
+    return master
+
+
+async def serve_proxy(master):
+    import asyncio
+
+    try:
+        await master.run()
+    finally:
+        # DumpMaster's done hooks do not close listening sockets themselves.
+        # Release them before asyncio tears down its loop on graceful shutdown.
+        server = master.addons.get("proxyserver")
+        if server is not None:
+            await asyncio.wait_for(server.servers.update([]), timeout=5)
+
+
+async def run_proxy(port, confdir, addon_path=None):
+    import asyncio
+    import signal
+
+    master = create_proxy(port, confdir, addon_path)
+    loop = asyncio.get_running_loop()
+    try:
+        loop.add_signal_handler(signal.SIGTERM, master.shutdown)
+    except NotImplementedError:
+        # Windows event loops do not implement add_signal_handler.
+        signal.signal(signal.SIGTERM, lambda *_: master.shutdown())
+    await serve_proxy(master)
+
+
+def main():
+    import argparse
+    import asyncio
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="Run the local agy filtering proxy")
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--confdir", required=True)
+    parser.add_argument("--addon", help="Load a custom mitmproxy script once")
+    arguments = parser.parse_args()
+    if not 1 <= arguments.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
+    if LOG == "@@" + "LOG@@" or VERBOSE_FLAG == "@@" + "VERBOSE_FLAG@@":
+        parser.error("run the installed addon.py after template substitution")
+    try:
+        asyncio.run(run_proxy(arguments.port, str(Path(arguments.confdir).resolve()), arguments.addon))
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
