@@ -38,7 +38,7 @@ Google режет доступ по стране аккаунта. Локаль�
 Ровно **одну** вещь — региональное предупреждение, которое Antigravity CLI показывает сразу после запуска:
 
 <div align="center">
-<img src="assets/warning.svg" width="720" alt="До: Eligibility check failed — аккаунт недоступен в вашем регионе. После: agy отвечает как обычно.">
+<img src="assets/before-after.svg" width="720" alt="До: Eligibility check failed — аккаунт недоступен в вашем регионе. После: agy отвечает как обычно.">
 <br><sub>Иллюстрация сообщения и результата, а не буквальный скриншот.</sub>
 </div>
 

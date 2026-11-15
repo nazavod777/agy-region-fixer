@@ -38,7 +38,7 @@ Google 会根据账号所在国家限制访问。本地 MITM 代理会从 `loadC
 只修复**一件事** —— Antigravity CLI 启动后立即显示的地区警告：
 
 <div align="center">
-<img src="assets/warning.svg" width="720" alt="之前：Eligibility check failed，账号在你所在地区不可用。之后：agy 正常回复。">
+<img src="assets/before-after.svg" width="720" alt="之前：Eligibility check failed，账号在你所在地区不可用。之后：agy 正常回复。">
 <br><sub>消息与效果的示意图，并非真实截图。</sub>
 </div>
 

@@ -38,7 +38,7 @@ Google restricts access by the account's country. A local MITM proxy strips `ine
 Exactly **one** thing — the region warning that Antigravity CLI shows right after start:
 
 <div align="center">
-<img src="assets/warning.svg" width="720" alt="Before: Eligibility check failed because the account is not available in your location. After: agy answers normally.">
+<img src="assets/before-after.svg" width="720" alt="Before: Eligibility check failed because the account is not available in your location. After: agy answers normally.">
 <br><sub>Illustration of the message and of the result, not a literal screenshot.</sub>
 </div>
 
