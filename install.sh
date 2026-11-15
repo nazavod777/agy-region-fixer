@@ -1110,7 +1110,12 @@ chmod 755 "$PREFIX/uninstall.sh"
 smoke_succeeded() {
   [[ "$1" -eq 0 ]] || return 1
   # Ignore terminal colours, but never accept an echoed prompt containing the token.
-  sed -E $'s/\033\\[[0-?]*[ -/]*[@-~]//g' "$2" | grep -E '^[[:space:]]*BYPASS_OK[[:space:]]*$' >/dev/null
+  "$PYBIN" -I -c '
+import re, sys
+with open(sys.argv[1], encoding="utf-8", errors="replace") as output:
+    matched = any(re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line).strip() == "BYPASS_OK" for line in output)
+sys.exit(0 if matched else 1)
+' "$2"
 }
 if [[ -n "${AGY_BIN:-}" ]] && { [[ -f "$(resolve_link "$AGY_BIN")" ]] || is_launcher "$(resolve_link "$AGY_BIN")"; }; then
   say "Smoke test: agy -p (up to 120 s)"

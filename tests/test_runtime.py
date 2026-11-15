@@ -70,13 +70,18 @@ class UnixRuntimeTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name)
         self.ledger = self.path / "processes.jsonl"
+        self.capture_path = self.path / "capture-path.txt"
+        self.shell_trace = self.path / "shell-trace.txt"
+        self.addCleanup(self.cleanup_capture_file)
         self.ready = self.path / "ready"
         os.mkfifo(self.ready)
         self.ready_fd = os.open(self.ready, os.O_RDWR | os.O_NONBLOCK)
         self.addCleanup(os.close, self.ready_fd)
         self.addCleanup(self.cleanup_owned_processes)
         self.env = dict(os.environ, PYBIN=sys.executable, TMPDIR=str(self.path),
-                        AGY_TEST_PID_FILE=str(self.ledger), AGY_TEST_READY_FILE=str(self.ready))
+                        AGY_TEST_PID_FILE=str(self.ledger), AGY_TEST_READY_FILE=str(self.ready),
+                        AGY_TEST_CAPTURE_PATH=str(self.capture_path),
+                        AGY_TEST_SHELL_TRACE_FILE=str(self.shell_trace))
         for name in ("BASH_ENV", "ENV"):
             self.env.pop(name, None)
 
@@ -101,6 +106,10 @@ class UnixRuntimeTests(unittest.TestCase):
             except ProcessLookupError:
                 pass
         self.wait_for_owned_processes(timeout=3)
+
+    def cleanup_capture_file(self):
+        if self.capture_path.exists():
+            Path(self.capture_path.read_text(encoding="utf-8").rstrip("\n")).unlink(missing_ok=True)
 
     def wait_for_owned_processes(self, timeout):
         deadline = time.monotonic() + timeout
@@ -163,7 +172,17 @@ record_process(os.getppid())
 
     def shell_source(self, body):
         return (self.prologue + self.helpers["run_with_timeout"] + "\n"
-                + self.helpers["capture_owner_path"] + "\n" + body)
+                + self.helpers["capture_owner_path"] + """
+
+# Record the platform mktemp result: macOS can choose its user temp directory
+# before TMPDIR. Keep the actual command and its arguments unchanged.
+mktemp() {
+  local path
+  path="$(command mktemp "$@")" || return
+  printf '%s\\n' "$path" > "$AGY_TEST_CAPTURE_PATH"
+  printf '%s\\n' "$path"
+}
+""" + body)
 
     def run_shell(self, body, timeout=8):
         process = subprocess.Popen(
@@ -176,7 +195,7 @@ record_process(os.getppid())
         except BaseException:
             self.cleanup_owned_processes()
             if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
+                process.kill()
             process.communicate(timeout=3)
             raise
         return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
@@ -195,7 +214,6 @@ record_process(os.getppid())
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
-        existing_paths = set(self.path.iterdir())
         process = subprocess.Popen(
             [BASH, str(script)], env=self.env, stdin=slave, stdout=slave, stderr=slave,
             preexec_fn=terminal_session,
@@ -206,9 +224,8 @@ record_process(os.getppid())
         try:
             if interrupt is not None:
                 self.wait_ready()
-                created = set(self.path.iterdir()) - existing_paths - {self.ledger}
-                self.assertEqual(len(created), 1, "The capture did not create exactly one temporary file")
-                capture_file = created.pop()
+                capture_file = Path(self.capture_path.read_text(encoding="utf-8").rstrip("\n"))
+                self.assertTrue(capture_file.is_file(), "The capture did not create its recorded temporary file")
                 if interrupt == signal.SIGINT:
                     os.write(master, b"\x03")
                 elif signal_group:
@@ -235,14 +252,60 @@ record_process(os.getppid())
                 output.extend(chunk)
                 self.assertLess(len(output), 65536, "Unexpected unbounded terminal output")
             return status, output.decode("utf-8", errors="replace")
+        except Exception as error:
+            diagnostics = self.terminal_diagnostics(process, master, output)
+            self.cleanup_owned_processes()
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
+            raise AssertionError(diagnostics) from error
         except BaseException:
             self.cleanup_owned_processes()
             if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=3)
+                process.kill()
+            process.wait(timeout=3)
             raise
         finally:
             os.close(master)
+
+    def terminal_diagnostics(self, process, master, output):
+        deadline = time.monotonic() + 0.2
+        while len(output) < 65536:
+            readable, _, _ = select.select([master], [], [], max(0, deadline - time.monotonic()))
+            if not readable:
+                break
+            try:
+                chunk = os.read(master, 4096)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                break
+            if not chunk:
+                break
+            output.extend(chunk)
+            if time.monotonic() >= deadline:
+                break
+        details = []
+        for pid in sorted({process.pid} | {item["pid"] for item in self.owned_processes()}):
+            current = process_details(pid)
+            if current is not None:
+                try:
+                    current["sid"] = os.getsid(pid)
+                except ProcessLookupError:
+                    continue
+            details.append(current)
+        capture = (self.capture_path.read_text(encoding="utf-8").rstrip("\n")
+                   if self.capture_path.exists() else None)
+        trace = ""
+        if self.shell_trace.exists():
+            with self.shell_trace.open("rb") as log:
+                log.seek(0, os.SEEK_END)
+                log.seek(max(0, log.tell() - 16384))
+                trace = log.read().decode("utf-8", errors="replace")
+        return ("Terminal command failed; processes=%r; TMPDIR=%r; capture=%r; files=%r; output=%r; shell_trace=%r"
+                % (details, self.env["TMPDIR"], capture,
+                   sorted(path.name for path in self.path.iterdir()),
+                   output.decode("utf-8", errors="replace"), trace))
 
     def test_interactive_login_path_works_in_a_real_terminal(self):
         home = self.path / "home"
@@ -253,9 +316,18 @@ record_process(os.getppid())
             'case $- in *i*) ;; *) return ;; esac\nexport PATH=' + shlex.quote(expected) + "\n",
             encoding="utf-8",
         )
+        command = self.fixture("""
+trace_fd = os.open(os.environ['AGY_TEST_SHELL_TRACE_FILE'],
+                   os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.dup2(trace_fd, 2)
+os.close(trace_fd)
+os.execve(%r, [%r, '-xlic', %r], %r)
+""" % (
+            BASH, BASH, 'printf "\\n@@AGYPATH@@%s@@\\n" "$PATH"',
+            {"HOME": str(home), "USER": "synthetic", "TERM": "dumb"},
+        ))
         status, output = self.run_in_terminal("""
-capture_owner_path env -i HOME=""" + shlex.quote(str(home)) + """ USER=synthetic TERM=dumb \
-  """ + shlex.quote(BASH) + """ -lic 'printf "\\n@@AGYPATH@@%s@@\\n" "$PATH"'
+capture_owner_path """ + command + """
 printf 'OWNER_PATH=%s\\n' "$OWNER_PATH"
 """)
         self.assertEqual(status, 0, output)

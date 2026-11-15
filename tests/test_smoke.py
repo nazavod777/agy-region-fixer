@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -37,6 +38,7 @@ class SmokeTests(unittest.TestCase):
                     result = subprocess.run(
                         [bash, "-o", "pipefail", "-c", match[0] + '\nsmoke_succeeded "$1" "$2"',
                          "smoke-test", str(status), str(output)],
+                        env=dict(os.environ, PYBIN=sys.executable),
                         capture_output=True, text=True, timeout=10,
                     )
                     self.assertEqual(result.returncode, 0 if expected else 1, result.stderr)
