@@ -85,7 +85,8 @@ function Invoke-OwnedProcess {
     [string[]]$Arguments = @(),
     [string]$WorkingDirectory,
     [hashtable]$Environment = @{},
-    [AllowEmptyString()][string]$StandardInput = ""
+    [AllowEmptyString()][string]$StandardInput = "",
+    [ValidateRange(1, 30000)][int]$TimeoutMilliseconds = 8000
   )
   $start = [Diagnostics.ProcessStartInfo]::new()
   $start.FileName = $FilePath
@@ -108,10 +109,10 @@ function Invoke-OwnedProcess {
     $stderr = $process.StandardError.ReadToEndAsync()
     $process.StandardInput.Write($StandardInput)
     $process.StandardInput.Close()
-    if (-not $process.WaitForExit(8000)) { throw "Process exceeded 8 seconds: $FilePath" }
-    $remaining = [Math]::Max(1, 8000 - [int]$watch.ElapsedMilliseconds)
+    if (-not $process.WaitForExit($TimeoutMilliseconds)) { throw "Process exceeded $TimeoutMilliseconds ms: $FilePath" }
+    $remaining = [Math]::Max(1, $TimeoutMilliseconds - [int]$watch.ElapsedMilliseconds)
     if (-not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdout, $stderr), $remaining)) {
-      throw "Process streams exceeded 8 seconds: $FilePath"
+      throw "Process streams exceeded $TimeoutMilliseconds ms: $FilePath"
     }
     return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdout.Result; Stderr = $stderr.Result }
   } finally {
@@ -270,7 +271,7 @@ class LauncherFixture {
   $availableCompilers = @($compilers | Where-Object { [IO.File]::Exists($_) })
   Assert-True ($availableCompilers.Count -gt 0) "Built-in .NET Framework C# compiler is missing"
   $compiler = $availableCompilers[0]
-  $compile = Invoke-OwnedProcess -FilePath $compiler -Arguments @("/nologo", "/target:exe", "/reference:System.Web.Extensions.dll", "/out:$fixturePath", $fixtureSourcePath) -WorkingDirectory $scratch
+  $compile = Invoke-OwnedProcess -FilePath $compiler -Arguments @("/nologo", "/target:exe", "/reference:System.Web.Extensions.dll", "/out:$fixturePath", $fixtureSourcePath) -WorkingDirectory $scratch -TimeoutMilliseconds 30000
   Assert-Equal $compile.ExitCode 0 ("Fixture compilation failed: " + $compile.Stdout + $compile.Stderr)
 
   $arguments = @("", "two words", "Unicode Ж 中", "trailing\", 'embedded"quote', "%PATH%", "bang!value", "amp&value", "pipe|value", "caret^value", "(parentheses)", 'before" & echo INJECTED>agy-injected-sentinel.txt & rem "after')
