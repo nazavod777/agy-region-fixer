@@ -86,7 +86,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://raw.git
 
 ### 📋 Требования
 
-- 🐍 Python **3.12 или 3.13** (так требует mitmproxy 12.x; установщик сам найдёт `python3.13`/`python3.12`)
+- 🐍 Python **3.12 или 3.13** (так требует mitmproxy 12.x), полная сборка с `ctypes`, `ssl` и `zlib`. Установщик проверяет все `python3.13`/`python3.12`/`python3` в `PATH` и пропускает неполные — например, Python, собранный из исходников без `libffi-dev`
 - 🌐 `curl`, установленный и залогиненный Antigravity CLI
 - 🐧 Linux: systemd и `runuser` или `setpriv` (оба из `util-linux`, есть везде)
 

@@ -86,7 +86,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://raw.git
 
 ### 📋 环境要求
 
-- 🐍 Python **3.12 或 3.13**（mitmproxy 12.x 的要求；安装脚本会自动查找 `python3.13`/`python3.12`）
+- 🐍 Python **3.12 或 3.13**（mitmproxy 12.x 的要求），且须为包含 `ctypes`、`ssl`、`zlib` 的完整构建。安装脚本会检查 `PATH` 中所有 `python3.13`/`python3.12`/`python3`，并跳过不完整的版本（例如未安装 `libffi-dev` 就从源码编译的 Python）
 - 🌐 `curl`，以及已安装并登录的 Antigravity CLI
 - 🐧 Linux：systemd，以及 `runuser` 或 `setpriv`（都包含在 `util-linux` 中）
 

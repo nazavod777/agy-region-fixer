@@ -62,21 +62,52 @@ if [[ $NEED_ROOT -eq 1 ]]; then
   command -v systemctl >/dev/null || err "systemd not found (containers/WSL1 are not supported)"
 fi
 
-# mitmproxy 12.x needs python >=3.12, <3.14: the default python3 may be
-# older or newer (on 3.14 pip silently installs a broken environment without pyparsing) —
-# pick a suitable interpreter from the candidates
-PY_OK='import sys; v=sys.version_info; sys.exit(0 if (3,12)<=v<(3,14) else 1)'
-PYBIN=""
-for CAND in python3.13 python3.12 python3; do
-  if command -v "$CAND" >/dev/null 2>&1 && "$CAND" -c "$PY_OK" >/dev/null 2>&1; then
-    PYBIN="$CAND"; break
-  fi
+# mitmproxy 12.x needs python >=3.12, <3.14 (on 3.14 pip silently installs a broken
+# environment without pyparsing). The version alone is not enough: a Python built from
+# source without dev headers lacks stdlib C modules, and mitmdump crashes at start
+# ("No module named '_ctypes'"). Without these three it never starts (measured on
+# mitmproxy 12.3.1); anything else is caught by checking the finished venv.
+PY_REQUIRED_MODULES="ctypes ssl zlib"
+PY_DEV_HINT="Debian/Ubuntu: apt install python3.12 python3.12-venv; macOS: brew install python@3.12 (or xcode-select --install); a self-built Python needs libffi-dev libssl-dev zlib1g-dev before ./configure"
+
+# prints "OK<TAB>realpath" if the interpreter fits, otherwise "NO<TAB>reason"
+python_check() {
+  "$1" - $PY_REQUIRED_MODULES 2>/dev/null <<'PYCHECK' || printf 'NO\tdoes not run\n'
+import os, sys
+v = sys.version_info
+if not (3, 12) <= v[:2] < (3, 14):
+    print("NO\tversion %d.%d.%d (need 3.12 or 3.13)" % v[:3]); sys.exit(0)
+missing = []
+for name in sys.argv[1:]:
+    try:
+        __import__(name)
+    except Exception:
+        missing.append(name)
+if missing:
+    print("NO\t%d.%d.%d without stdlib modules: %s" % (v[0], v[1], v[2], " ".join(missing)))
+else:
+    print("OK\t" + os.path.realpath(sys.executable))
+PYCHECK
+}
+
+# every python3.13 / python3.12 / python3 on PATH (not only the first one: /usr/local
+# often shadows a working distro build), deduplicated by the real interpreter
+PY_CANDIDATES=()
+PY_REJECTED=""
+PY_SEEN=$'\n'
+for PY_NAME in python3.13 python3.12 python3; do
+  while IFS= read -r PY_PATH; do
+    [[ -n "$PY_PATH" ]] || continue
+    IFS=$'\t' read -r PY_STATUS PY_INFO < <(python_check "$PY_PATH") || PY_STATUS=""
+    if [[ "$PY_STATUS" == OK ]]; then
+      [[ "$PY_SEEN" == *$'\n'"$PY_INFO"$'\n'* ]] && continue
+      PY_SEEN="$PY_SEEN$PY_INFO"$'\n'
+      PY_CANDIDATES+=("$PY_PATH")
+    else
+      PY_REJECTED="$PY_REJECTED  - $PY_PATH: $PY_INFO"$'\n'
+    fi
+  done < <(type -ap "$PY_NAME" 2>/dev/null || true)
 done
-[[ -n "$PYBIN" ]] || err "python 3.12 or 3.13 is required (for mitmproxy); install: apt install python3.12-venv / brew install python@3.12"
-if [[ "$PYBIN" == python3 ]] ; then
-  # macOS: python3 from CLT sometimes lacks the venv module
-  "$PYBIN" -m venv --help >/dev/null 2>&1 || err "python3 has no venv — install Xcode Command Line Tools: xcode-select --install"
-fi
 
 # honest TCP probe: ANY listening port counts as busy (curl got confused by non-HTTP)
 port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; }
@@ -106,24 +137,77 @@ mkdir -p "$PREFIX" "$CA_DIR"
 # foreign packages of incompatible versions leak into it — clean it for all
 # python/pip install operations
 CLEAN_ENV=(env -u PYTHONPATH -u SSL_CERT_FILE -u HTTPS_PROXY -u https_proxy)
-if [[ ! -x "$VENV/bin/mitmdump" ]]; then
-  "${CLEAN_ENV[@]}" "$PYBIN" -m venv "$VENV" 2>/dev/null || {
-    say "python -m venv failed — installing python3-venv with the package manager"
-    if   command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq "python${PYBIN#python}-venv" python3-pip
-    elif command -v dnf     >/dev/null; then dnf install -y python3-pip
-    elif command -v zypper  >/dev/null; then zypper --non-interactive install python3-pip
-    elif command -v apk     >/dev/null; then apk add py3-virtualenv py3-pip
-    elif command -v pacman  >/dev/null; then say "Arch: python3-venv usually ships in the python package; if venv is missing, install: pacman -S python"
-    fi
-    "${CLEAN_ENV[@]}" "$PYBIN" -m venv "$VENV"
-  }
-  "${CLEAN_ENV[@]}" "$VENV/bin/pip" install --quiet --upgrade pip
-  "${CLEAN_ENV[@]}" "$VENV/bin/pip" install --quiet "$AGY_PIN"
+PY_LOG="$PREFIX/python-setup.log"   # venv/pip/mitmdump output; its tail is shown on failure
+: > "$PY_LOG"
+AGY_PIN_VERSION="${AGY_PIN#*==}"
+
+# a working venv = mitmdump starts and reports the pinned version. This catches "pip said
+# ok, but the environment is broken" (python 3.14 without pyparsing, missing stdlib
+# modules, a foreign cryptography from PYTHONPATH) and an outdated pin
+venv_works() {
+  local out
+  [[ -x "$VENV/bin/mitmdump" ]] || return 1
+  out="$("${CLEAN_ENV[@]}" "$VENV/bin/mitmdump" --version 2>&1)" || { printf '%s\n' "$out" >> "$PY_LOG"; return 1; }
+  [[ "$out" == *"$AGY_PIN_VERSION"* ]] || { printf 'outdated: %s\n' "$out" >> "$PY_LOG"; return 1; }
+}
+
+# the distro splits the venv module into a separate package (Debian/Ubuntu: python3.X-venv)
+install_venv_package() {
+  local ver="$1"
+  if   command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq "python${ver}-venv" python3-pip
+  elif command -v dnf     >/dev/null; then dnf install -y python3-pip
+  elif command -v zypper  >/dev/null; then zypper --non-interactive install python3-pip
+  elif command -v apk     >/dev/null; then apk add py3-virtualenv py3-pip
+  else return 1
+  fi
+}
+
+# builds the venv from scratch with interpreter $1; 0 only if mitmdump works in it
+build_venv() {
+  local py="$1" ver
+  ver="$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+  rm -rf "$VENV"
+  if ! "${CLEAN_ENV[@]}" "$py" -m venv "$VENV" >> "$PY_LOG" 2>&1; then
+    rm -rf "$VENV"
+    # a package manager only helps the distro's own interpreter, not a /usr/local build
+    [[ "$py" == /usr/bin/* ]] || return 1
+    say "python -m venv failed for $py — installing the venv package with the package manager"
+    install_venv_package "$ver" >> "$PY_LOG" 2>&1 || return 1
+    "${CLEAN_ENV[@]}" "$py" -m venv "$VENV" >> "$PY_LOG" 2>&1 || return 1
+  fi
+  "${CLEAN_ENV[@]}" "$VENV/bin/pip" install --quiet --upgrade pip >> "$PY_LOG" 2>&1 || return 1
+  "${CLEAN_ENV[@]}" "$VENV/bin/pip" install --quiet "$AGY_PIN" >> "$PY_LOG" 2>&1 || return 1
+  venv_works
+}
+
+if venv_works; then
+  say "venv with mitmproxy $AGY_PIN_VERSION is already in place — reusing it"
+else
+  # a venv left by a failed or older install is rebuilt: otherwise every re-run
+  # would hit the same broken environment
+  [[ ! -e "$VENV" ]] || say "the existing venv is broken or outdated — rebuilding it"
+  if [[ -n "$PY_REJECTED" ]]; then
+    say "skipped interpreters:"; printf '%s' "$PY_REJECTED"
+  fi
+  VENV_OK=0
+  for PY_PATH in ${PY_CANDIDATES[@]+"${PY_CANDIDATES[@]}"}; do
+    say "python: $PY_PATH ($("$PY_PATH" --version 2>&1))"
+    if build_venv "$PY_PATH"; then VENV_OK=1; break; fi
+    say "⚠️  mitmproxy does not work with $PY_PATH — trying the next interpreter"
+    PY_REJECTED="$PY_REJECTED  - $PY_PATH: venv/mitmproxy setup failed"$'\n'
+  done
+  if [[ $VENV_OK -ne 1 ]]; then
+    rm -rf "$VENV"
+    {
+      echo "no usable Python 3.12/3.13 found:"
+      if [[ -n "$PY_REJECTED" ]]; then printf '%s' "$PY_REJECTED"
+      else echo "  - no python3.13 / python3.12 / python3 on PATH"; fi
+      if [[ -s "$PY_LOG" ]]; then echo "last lines of $PY_LOG:"; tail -n 8 "$PY_LOG"; fi
+    } >&2
+    err "install a complete Python 3.12/3.13 — $PY_DEV_HINT"
+  fi
 fi
-# catch "pip said ok, but the environment is broken" (python 3.14 without pyparsing, a foreign
-# cryptography from PYTHONPATH, etc.)
-"${CLEAN_ENV[@]}" "$VENV/bin/mitmdump" --version >/dev/null 2>&1 \
-  || err "mitmproxy failed to install or is broken (python $("$PYBIN" --version 2>&1)) — try python 3.12/3.13"
+PYBIN="$VENV/bin/python"   # a verified interpreter for the remaining install steps
 
 # ---------------------------------------------------------------------------
 say "2/6 Addon: strips ineligibleTiers from Google responses"

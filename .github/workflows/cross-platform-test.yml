@@ -198,11 +198,20 @@ jobs:
       - name: Pipe-style install fetches addon.py (ubuntu only)
         if: runner.os == 'Linux'
         run: |
-          set -e
+          set -eo pipefail   # the install output goes through tee
           mkdir -p /tmp/pipe && cp install.sh /tmp/pipe/
           ADDON_URL="file://$GITHUB_WORKSPACE/addon.py"
+          # an incomplete python3.13 first on PATH (like a source build without libffi):
+          # the installer must skip it and use a working interpreter instead
+          mkdir -p /tmp/brokenpy/site
+          echo 'import sys; sys.modules["_ctypes"] = None' > /tmp/brokenpy/site/sitecustomize.py
+          printf '#!/bin/sh\nPYTHONPATH=/tmp/brokenpy/site exec %s "$@"\n' "$(command -v python3)" > /tmp/brokenpy/python3.13
+          chmod +x /tmp/brokenpy/python3.13
+          if /tmp/brokenpy/python3.13 -c 'import ctypes' 2>/dev/null; then echo "FAIL: the test wrapper is not broken"; exit 1; fi
           cd /tmp/pipe
-          sudo env "PATH=$PATH" "AGY_ADDON_URL=$ADDON_URL" AGY_BYPASS_PORT=8091 AGY_BYPASS_PREFIX=/opt/agy-pipe-test bash install.sh
+          sudo env "PATH=/tmp/brokenpy:$PATH" "AGY_ADDON_URL=$ADDON_URL" AGY_BYPASS_PORT=8091 AGY_BYPASS_PREFIX=/opt/agy-pipe-test bash install.sh | tee /tmp/pipe/install.out
+          grep -q '/tmp/brokenpy/python3.13: .* without stdlib modules: ctypes' /tmp/pipe/install.out \
+            || { echo "FAIL: the broken python3.13 was not skipped"; exit 1; }
           grep -q 'ineligibleTiers' /opt/agy-pipe-test/addon.py
           if grep -qE '@@LOG@@|@@VERBOSE_FLAG@@' /opt/agy-pipe-test/addon.py; then echo "FAIL: placeholders were not substituted"; exit 1; fi
           test -f /opt/agy-pipe-test/ca/mitmproxy-ca-cert.pem

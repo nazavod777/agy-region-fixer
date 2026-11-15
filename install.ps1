@@ -75,7 +75,18 @@ Say "1/6 venv + mitmproxy (pinned version, system untouched)"
 New-Item -ItemType Directory -Force -Path $PREFIX, $CA_DIR | Out-Null
 # PYTHONPATH from the environment (CI, activated venvs, IDEs) poisons the venv — clear it
 Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
-$venvMitm = Join-Path $PREFIX "venv\Scripts\mitmdump.exe"
+$venvDir  = Join-Path $PREFIX "venv"
+$venvMitm = Join-Path $venvDir "Scripts\mitmdump.exe"
+$pinVersion = $PIN.Split("=")[-1]
+function Get-MitmVersion {
+  try { $o = (& $venvMitm --version 2>&1 | Out-String); if ($LASTEXITCODE -eq 0) { return $o } } catch {}
+  return $null
+}
+# a venv from a failed or older install is rebuilt, otherwise every re-run fails the same way
+if ((Test-Path $venvDir) -and -not ("$(Get-MitmVersion)" -like "*$pinVersion*")) {
+  Say "the existing venv is broken or outdated - rebuilding it"
+  Remove-Item -LiteralPath $venvDir -Recurse -Force
+}
 if (-not (Test-Path $venvMitm)) {
   & $py -m venv (Join-Path $PREFIX "venv")
   if ($LASTEXITCODE -ne 0) { Die "failed to create venv" }
@@ -85,8 +96,10 @@ if (-not (Test-Path $venvMitm)) {
   if ($LASTEXITCODE -ne 0) { Die "failed to install mitmproxy" }
 }
 # catch "pip said OK but the environment is broken" (happened on python 3.14: no pyparsing)
-try { & $venvMitm --version | Out-Null; if ($LASTEXITCODE -ne 0) { throw } }
-catch { Die "mitmproxy is broken — Python 3.12/3.13 required (see the script header)" }
+if (-not ("$(Get-MitmVersion)" -like "*$pinVersion*")) {
+  $why = try { (& $venvMitm --version 2>&1 | Select-Object -Last 2) -join " " } catch { "$_" }
+  Die "mitmproxy does not start with $(& $py --version): $why"
+}
 
 # --- addon -----------------------------------------------------------------
 Say "2/6 Addon: strips ineligibleTiers from Google responses"
