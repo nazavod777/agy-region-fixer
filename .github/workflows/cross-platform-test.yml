@@ -259,7 +259,10 @@ jobs:
           sudo chmod 755 "$STORE/agy"
           mkdir -p "$HOME/.nix-profile"; ln -sfn "$STORE" "$HOME/.nix-profile/bin"   # a whole bin dir is linked, as nix does
           SUM="$(sha256sum "$STORE/agy" | cut -d' ' -f1)"
-          sudo env "PATH=/usr/sbin:/usr/bin:/sbin:/bin" AGY_BYPASS_PORT=8092 AGY_BYPASS_PREFIX=/opt/agy-launcher-test bash install.sh | tee /tmp/launcher.out
+          # Keep setup-python's interpreter: Ubuntu 26's system Python is too new for mitmproxy 12.x.
+          # The owner's CLI directories stay absent, as with sudo's secure_path.
+          SECURE_PATH="$(dirname "$(command -v python)"):/usr/sbin:/usr/bin:/sbin:/bin"
+          sudo env "PATH=$SECURE_PATH" AGY_BYPASS_PORT=8092 AGY_BYPASS_PREFIX=/opt/agy-launcher-test bash install.sh | tee /tmp/launcher.out
           grep -q 'agy is a launcher' /tmp/launcher.out || { echo "FAIL: the launcher was not recognised"; exit 1; }
           [[ "$(sha256sum "$STORE/agy" | cut -d' ' -f1)" == "$SUM" ]] || { echo "FAIL: the launcher was modified"; exit 1; }
           test ! -e "$STORE/agy.real" || { echo "FAIL: agy.real appeared in the store"; exit 1; }
@@ -281,7 +284,7 @@ jobs:
           # Two launcher entries must not compete for the same wrapper.
           mkdir -p "$HOME/.nix-next"; ln -s "$STORE" "$HOME/.nix-next/bin"
           NEXT="$HOME/.nix-next/bin/agy"
-          sudo env "PATH=/usr/sbin:/usr/bin:/sbin:/bin" "AGY_BYPASS_BIN=$NEXT" AGY_BYPASS_PORT=8092 AGY_BYPASS_PREFIX=/opt/agy-launcher-test bash install.sh
+          sudo env "PATH=$SECURE_PATH" "AGY_BYPASS_BIN=$NEXT" AGY_BYPASS_PORT=8092 AGY_BYPASS_PREFIX=/opt/agy-launcher-test bash install.sh
           awk 'END { exit (NR != 1) }' /opt/agy-launcher-test/wrappers.path
           grep -qxF "$NEXT" /opt/agy-launcher-test/shim.path
           if grep -qxF "$HOME/.nix-profile/bin/agy" /opt/agy-launcher-test/shim.path; then echo "FAIL: the old launcher is still registered"; exit 1; fi
@@ -294,7 +297,7 @@ jobs:
           test ! -e /usr/local/bin/agy
           printf '#!/bin/sh\necho "plain-ci-agy $@"\n' | sudo tee /usr/local/bin/agy >/dev/null
           sudo chmod 755 /usr/local/bin/agy
-          sudo env "PATH=/usr/sbin:/usr/bin:/sbin:/bin" AGY_BYPASS_BIN=/usr/local/bin/agy AGY_BYPASS_PORT=8092 AGY_BYPASS_PREFIX=/opt/agy-launcher-test bash install.sh
+          sudo env "PATH=$SECURE_PATH" AGY_BYPASS_BIN=/usr/local/bin/agy AGY_BYPASS_PORT=8092 AGY_BYPASS_PREFIX=/opt/agy-launcher-test bash install.sh
           test ! -e "$HOME/.local/bin/agy" || { echo "FAIL: a stale wrapper masks the replacement CLI"; exit 1; }
           [[ "$(/usr/local/bin/agy hi)" == *"plain-ci-agy hi"* ]]
           sudo bash /opt/agy-launcher-test/heal.sh
