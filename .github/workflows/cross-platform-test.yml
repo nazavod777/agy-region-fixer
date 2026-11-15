@@ -10,7 +10,7 @@ name: cross-platform-test
 on:
   push:
     branches: [master]
-    paths: [install.sh, install.ps1, addon.py, .github/workflows/cross-platform-test.yml]
+    paths: [install.sh, install.ps1, addon.py, 'tests/**', .github/workflows/cross-platform-test.yml]
   workflow_dispatch:   # full 3-OS run on demand
 
 jobs:
@@ -75,6 +75,19 @@ jobs:
         run: ./install.ps1
         env:
           AGY_BYPASS_PORT: "8090"
+
+      - name: Verify addon filtering and diagnostics (unix)
+        if: runner.os != 'Windows'
+        run: |
+          PREFIX="/opt/agy-region-fixer"; [[ "$(uname -s)" == "Darwin" ]] && PREFIX="$HOME/.agy-region-fixer"
+          "$PREFIX/venv/bin/python" -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Verify addon filtering and diagnostics (windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & "$env:USERPROFILE\.agy-region-fixer\venv\Scripts\python.exe" -m unittest discover -s tests -p 'test_*.py' -v
+          if ($LASTEXITCODE -ne 0) { throw "Addon regression tests failed" }
 
       - name: Verify proxy is listening and CA exists (unix)
         if: runner.os != 'Windows'
@@ -231,6 +244,70 @@ jobs:
           out="$("$HOME/.local/bin/agy" hi)"
           [[ "$out" == *"fake-agy"* ]]
           echo "PIPE INSTALL OK"
+
+      # agy that cannot be replaced in place (snap, nix: a link into a read-only store): the installer
+      # must leave it alone and put a wrapper earlier in the user's PATH. sudo's PATH is narrowed
+      # to the system directories, as secure_path does, so agy has to be found the way the owner's shell finds it
+      - name: Launcher-style agy gets a wrapper (ubuntu only)
+        if: runner.os == 'Linux'
+        run: |
+          set -eo pipefail
+          rm -f "$HOME/.local/bin/agy"
+          STORE=/nix/store/ci-agy/bin
+          sudo mkdir -p "$STORE"
+          { printf '#!/bin/sh\necho "store-agy $@"\n#'; head -c 12000000 /dev/zero | tr '\0' 'x'; } | sudo tee "$STORE/agy" >/dev/null
+          sudo chmod 755 "$STORE/agy"
+          mkdir -p "$HOME/.nix-profile"; ln -sfn "$STORE" "$HOME/.nix-profile/bin"   # a whole bin dir is linked, as nix does
+          SUM="$(sha256sum "$STORE/agy" | cut -d' ' -f1)"
+          sudo env "PATH=/usr/sbin:/usr/bin:/sbin:/bin" AGY_BYPASS_PORT=8092 AGY_BYPASS_PREFIX=/opt/agy-launcher-test bash install.sh | tee /tmp/launcher.out
+          grep -q 'agy is a launcher' /tmp/launcher.out || { echo "FAIL: the launcher was not recognised"; exit 1; }
+          [[ "$(sha256sum "$STORE/agy" | cut -d' ' -f1)" == "$SUM" ]] || { echo "FAIL: the launcher was modified"; exit 1; }
+          test ! -e "$STORE/agy.real" || { echo "FAIL: agy.real appeared in the store"; exit 1; }
+          grep -q agy-region-fixer-shim "$HOME/.local/bin/agy" || { echo "FAIL: no wrapper in ~/.local/bin"; exit 1; }
+          [[ "$("$HOME/.local/bin/agy" hi)" == *"store-agy hi"* ]] || { echo "FAIL: the wrapper does not run the launcher"; exit 1; }
+          # heal restores a deleted wrapper
+          rm -f "$HOME/.local/bin/agy"
+          sudo bash /opt/agy-launcher-test/heal.sh
+          grep -q agy-region-fixer-shim "$HOME/.local/bin/agy" || { echo "FAIL: heal did not restore the wrapper"; exit 1; }
+          # A user-controlled parent can become a link into a root-only directory.
+          ROOT_TARGET="$(sudo mktemp -d /tmp/agy-wrapper-root.XXXXXX)"
+          sudo chmod 755 "$ROOT_TARGET"
+          mv "$HOME/.local/bin" "$HOME/.local/bin.wrapper-test"
+          ln -s "$ROOT_TARGET" "$HOME/.local/bin"
+          sudo bash /opt/agy-launcher-test/heal.sh
+          test ! -e "$ROOT_TARGET/agy" || { echo "FAIL: heal wrote the wrapper as root"; exit 1; }
+          rm "$HOME/.local/bin"; mv "$HOME/.local/bin.wrapper-test" "$HOME/.local/bin"
+          sudo rmdir "$ROOT_TARGET"
+          # Two launcher entries must not compete for the same wrapper.
+          mkdir -p "$HOME/.nix-next"; ln -s "$STORE" "$HOME/.nix-next/bin"
+          NEXT="$HOME/.nix-next/bin/agy"
+          sudo env "PATH=/usr/sbin:/usr/bin:/sbin:/bin" "AGY_BYPASS_BIN=$NEXT" AGY_BYPASS_PORT=8092 AGY_BYPASS_PREFIX=/opt/agy-launcher-test bash install.sh
+          awk 'END { exit (NR != 1) }' /opt/agy-launcher-test/wrappers.path
+          grep -qxF "$NEXT" /opt/agy-launcher-test/shim.path
+          if grep -qxF "$HOME/.nix-profile/bin/agy" /opt/agy-launcher-test/shim.path; then echo "FAIL: the old launcher is still registered"; exit 1; fi
+          HEAL_OUT="$(sudo bash /opt/agy-launcher-test/heal.sh)"
+          test -z "$HEAL_OUT" || { echo "FAIL: idle heal rewrote the wrapper"; exit 1; }
+          HEAL_OUT="$(sudo bash /opt/agy-launcher-test/heal.sh)"
+          test -z "$HEAL_OUT" || { echo "FAIL: repeated heal rewrote the wrapper"; exit 1; }
+          # A vanished profile must not leave a stale wrapper masking a new plain CLI.
+          rm "$HOME/.nix-next/bin"; rmdir "$HOME/.nix-next"
+          test ! -e /usr/local/bin/agy
+          printf '#!/bin/sh\necho "plain-ci-agy $@"\n' | sudo tee /usr/local/bin/agy >/dev/null
+          sudo chmod 755 /usr/local/bin/agy
+          sudo env "PATH=/usr/sbin:/usr/bin:/sbin:/bin" AGY_BYPASS_BIN=/usr/local/bin/agy AGY_BYPASS_PORT=8092 AGY_BYPASS_PREFIX=/opt/agy-launcher-test bash install.sh
+          test ! -e "$HOME/.local/bin/agy" || { echo "FAIL: a stale wrapper masks the replacement CLI"; exit 1; }
+          [[ "$(/usr/local/bin/agy hi)" == *"plain-ci-agy hi"* ]]
+          sudo bash /opt/agy-launcher-test/heal.sh
+          [[ "$(/usr/local/bin/agy hi)" == *"plain-ci-agy hi"* ]]
+          sudo bash /opt/agy-launcher-test/uninstall.sh
+          test ! -e "$HOME/.local/bin/agy" || { echo "FAIL: uninstall left the wrapper"; exit 1; }
+          [[ "$(/usr/local/bin/agy hi)" == *"plain-ci-agy hi"* ]]
+          test ! -e /usr/local/bin/agy.real
+          sudo rm /usr/local/bin/agy
+          [[ "$(sha256sum "$STORE/agy" | cut -d' ' -f1)" == "$SUM" ]]
+          rm "$HOME/.nix-profile/bin"; rmdir "$HOME/.nix-profile"
+          sudo rm "$STORE/agy"; sudo rmdir "$STORE" "$(dirname "$STORE")"
+          echo "LAUNCHER OK"
 
       - name: Uninstall and verify clean state (windows)
         if: runner.os == 'Windows'

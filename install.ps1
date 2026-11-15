@@ -230,7 +230,13 @@ function Save-ShimPath($path) {
 }
 $cmd = Get-Command agy -ErrorAction SilentlyContinue
 $shimPath = $null
-if ($cmd -and $cmd.Source -like "*.exe") {
+function Test-AgyLauncher($path) {
+  if ($path -match '[\\/]WindowsApps[\\/]') { return $true }
+  # Scoop launchers resolve a neighbouring .shim file and must keep their original name.
+  if ($path -like "*.exe" -and (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($path, ".shim")))) { return $true }
+  return $false
+}
+if ($cmd -and $cmd.Source -like "*.exe" -and -not (Test-AgyLauncher $cmd.Source)) {
   $agyExe = $cmd.Source
   $shimDir = Split-Path $agyExe
   $shimPath = Join-Path $shimDir "agy.cmd"
@@ -246,6 +252,13 @@ if ($cmd -and $cmd.Source -like "*.exe") {
   $shimPath = $cmd.Source
   Save-ShimPath $shimPath
   Say "shim updated: $shimPath"
+} elseif ($cmd) {
+  # found, but not as a plain agy.exe (npm .cmd/.ps1, a WindowsApps alias, a scoop shim): it cannot be
+  # swapped in place, and a wrapper for these is not implemented on Windows yet - say so instead of "not found"
+  Say "agy was found ($($cmd.Source), type $($cmd.CommandType)), but it is not a plain agy.exe, so the shim was NOT installed."
+  Say "The proxy itself works. Run agy through it manually:"
+  $manualCa = $ca.Replace("'", "''")
+  Say "  `$env:SSL_CERT_FILE='$manualCa'; `$env:HTTPS_PROXY='http://127.0.0.1:$PORT'; agy"
 } else {
   Say "agy not found in PATH — shim not installed. Install Antigravity CLI and re-run the installer."
 }
@@ -349,6 +362,11 @@ WriteBom (Join-Path $PREFIX "uninstall.ps1") $unPs1
 # (agy.cmd -> cmd.exe -> agy.real.exe); otherwise a hung request or a wait for login
 # would block the install forever
 $SMOKE_TIMEOUT_MS = 120000
+function Test-SmokeSuccess($exitCode, $lines) {
+  if ($exitCode -ne 0) { return $false }
+  $replies = @($lines | ForEach-Object { ($_ -replace '\x1b\[[0-?]*[ -/]*[@-~]', '').Trim() } | Where-Object { $_ -ceq 'BYPASS_OK' })
+  return $replies.Count -gt 0
+}
 $smokeCmd = Get-Command agy -ErrorAction SilentlyContinue
 if ($smokeCmd) {
   Say "Smoke test: agy -p (up to 120 s)"
@@ -361,8 +379,7 @@ if ($smokeCmd) {
       # stdout first: the model's answer is there; stderr is only a fallback source for the message
       $outLines = @(Get-Content -LiteralPath $smokeOut -ErrorAction SilentlyContinue | Where-Object { $_ })
       $errLines = @(Get-Content -LiteralPath $smokeErr -ErrorAction SilentlyContinue | Where-Object { $_ })
-      $hit = @($outLines + $errLines | Where-Object { $_ -like "*BYPASS_OK*" }) | Select-Object -First 1
-      if ($hit) { Say "OK — model replied: $hit — bypass works" }
+      if (Test-SmokeSuccess $proc.ExitCode @($outLines + $errLines)) { Say "OK — model replied: BYPASS_OK — bypass works" }
       else {
         $last = @($outLines + $errLines) | Select-Object -Last 1
         Say "agy did not reply BYPASS_OK: $last (did you log in? log: $PREFIX\mitm.log)"

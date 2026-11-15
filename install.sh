@@ -385,9 +385,10 @@ resolve_link() {
     if [[ "$t" = /* ]]; then p="$t"; else p="$(cd "$(dirname "$p")" && pwd)/$t"; fi
     i=$((i+1))
   done
-  # normalize ../ (if the file no longer exists — leave as is)
+  # normalize ../ and symlinked DIRECTORIES (nix profiles link whole bin dirs): the physical
+  # path is where the file really lives. If the file no longer exists — leave as is
   if [[ -e "$p" ]]; then
-    p="$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
+    p="$(cd -P "$(dirname "$p")" && pwd -P)/$(basename "$p")"
   fi
   printf '%s\n' "$p"
 }
@@ -396,10 +397,11 @@ resolve_link() {
 # in the C locale it emits $'\320..', which dash does not understand)
 sh_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
-# shim text for the real binary $1 (absolute path, safe to invoke via a symlink)
+# shim text for the real binary $1 (absolute path, safe to invoke via a symlink);
+# $2 — directory with the CA certificate as the CLI sees it (default: the prefix's own)
 render_shim() {
   printf '%s\n' '#!/bin/sh' "# $SHIM_MARKER"
-  printf 'PORT=%s\nCA_DIR=%s\nREAL=%s\n' "$(sh_quote "$PORT_SH")" "$(sh_quote "$CA_SH")" "$(sh_quote "$1")"
+  printf 'PORT=%s\nCA_DIR=%s\nREAL=%s\n' "$(sh_quote "$PORT_SH")" "$(sh_quote "${2:-$CA_SH}")" "$(sh_quote "$1")"
   cat <<'SHIMBODY'
 if curl -s --noproxy '*' -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/"; then
   export SSL_CERT_FILE="$CA_DIR/mitmproxy-ca-cert.pem"
@@ -413,9 +415,9 @@ SHIMBODY
 # before mv — the reader never sees a window of "file exists, x bit missing". Runs with the rights of the
 # directory owner (see the security model), so a race on the file name grants no privileges
 write_shim() {
-  local real="$1" dst="$2" tmp
+  local real="$1" dst="$2" ca_dir="${3:-}" tmp
   tmp="$(mktemp "$dst.XXXXXX")" || return 1
-  if render_shim "$real" > "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$dst"; then
+  if render_shim "$real" "$ca_dir" > "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$dst"; then
     return 0
   fi
   rm -f "$tmp"
@@ -457,11 +459,80 @@ entry_mode() {
   echo self
 }
 
+# --- launchers: entries that must NOT be replaced in place -----------------
+# snap: /snap/bin/agy -> antigravity-cli -> /usr/bin/snap (-> snapd itself); renaming that would
+# break snapd, and the snap is read-only anyway. Nix store paths are read-only as well.
+# For these the shim is a WRAPPER placed earlier in the user's PATH; the launcher stays untouched.
+is_launcher() {   # $1 = resolved target
+  case "$1" in
+    /snap/*|/usr/lib/snapd/*|/var/lib/snapd/*|/usr/bin/snap|/nix/store/*) return 0 ;;
+  esac
+  case "${1##*/}" in snap|snapd) return 0 ;; esac
+  return 1
+}
+
+# wrappers.path (written by install.sh, root-owned): entry <TAB> wrapper <TAB> ca_dir
+WRAPPERS_FILE="$PREFIX_SH/wrappers.path"
+wrapper_field() {   # $1 entry, $2 field number (2 = wrapper path, 3 = CA dir)
+  [[ -f "$WRAPPERS_FILE" ]] || return 0
+  awk -F'\t' -v e="$1" -v n="$2" '$1 == e { print $n; exit }' "$WRAPPERS_FILE"
+}
+
+# (re)create the wrapper for launcher $1. Idempotent: nothing is written when it is already
+# current, so a heal run triggered by our own write cannot loop
+wrap_entry() {
+  local entry="$1" force="$2" wrapper ca_dir tmp ca_src="$CA_SH/mitmproxy-ca-cert.pem"
+  wrapper="$(wrapper_field "$entry" 2)"; ca_dir="$(wrapper_field "$entry" 3)"
+  [[ -n "$wrapper" ]] || { echo "[heal] $entry is a launcher (snap/nix) and no wrapper is registered — rerun the installer"; return 1; }
+  [[ -e "$entry" ]] || return 0   # the application was removed: nothing to wrap
+  if [[ -L "$wrapper" ]] || { [[ -e "$wrapper" ]] && ! is_our_shim "$wrapper"; }; then
+    echo "[heal] $wrapper is not our wrapper — left as is"; return 0
+  fi
+  if [[ -n "$ca_dir" && "$ca_dir" != "$CA_SH" ]]; then
+    # the CA must sit where the confined app may read it (snap: ~/snap/<name>/common)
+    mkdir -p "$ca_dir" || { echo "[heal] FAILED to create $ca_dir"; return 1; }
+    if ! cmp -s "$ca_src" "$ca_dir/mitmproxy-ca-cert.pem" 2>/dev/null; then
+      tmp="$(mktemp "$ca_dir/.ca.XXXXXX")" || return 1
+      if cp "$ca_src" "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$ca_dir/mitmproxy-ca-cert.pem"; then :
+      else rm -f "$tmp"; echo "[heal] FAILED to copy the CA to $ca_dir"; return 1; fi
+    fi
+  fi
+  if [[ -f "$wrapper" ]] && [[ "$(cat "$wrapper")" == "$(render_shim "$entry" "$ca_dir")" ]]; then
+    [[ "$force" -ne 1 ]] || echo "[heal] wrapper is up to date: $wrapper -> $entry"
+    return 0
+  fi
+  write_shim "$entry" "$wrapper" "$ca_dir" || { echo "[heal] FAILED to write the wrapper $wrapper"; return 1; }
+  if [[ "$force" -eq 1 ]]; then echo "[heal] wrapper installed: $wrapper -> $entry (the launcher is untouched)"
+  else echo "[heal] restored the wrapper $wrapper"; fi
+}
+
+# uninstall: remove our wrapper and the CA copy; the launcher was never modified
+unwrap_entry() {
+  local entry="$1" wrapper ca_dir other_entry other_wrapper other_ca
+  wrapper="$(wrapper_field "$entry" 2)"; ca_dir="$(wrapper_field "$entry" 3)"
+  [[ -n "$wrapper" ]] || return 0
+  if [[ -f "$wrapper" && ! -L "$wrapper" ]] && is_our_shim "$wrapper"; then
+    rm -f "$wrapper" && echo "removed wrapper: $wrapper"
+  fi
+  if [[ -n "$ca_dir" && "$ca_dir" != "$CA_SH" ]]; then
+    # Snap aliases share a CA directory. Keep it while another installed wrapper
+    # still uses it; the final wrapper removed during uninstall cleans it up.
+    while IFS=$'\t' read -r other_entry other_wrapper other_ca; do
+      [[ "$other_entry" != "$entry" && "$other_ca" == "$ca_dir" ]] || continue
+      if [[ -f "$other_wrapper" ]] && is_our_shim "$other_wrapper"; then return 0; fi
+    done < "$WRAPPERS_FILE"
+    rm -f "$ca_dir/mitmproxy-ca-cert.pem"; rmdir "$ca_dir" 2>/dev/null || true
+  fi
+}
+
 # --- working operations on a single shim.path entry (print log lines) -------
 # $1 — shim.path entry, $2 — force: 1 on install (no size check)
 shim_entry() {
   local entry="$1" force="$2" target size prev stable i
   target="$(resolve_link "$entry")"
+  if [[ -n "$(wrapper_field "$entry" 2)" ]] || is_launcher "$target"; then
+    wrap_entry "$entry" "$force"; return
+  fi
   [[ -e "$target" || -e "$target.real" ]] || return 0
   if is_our_shim "$target"; then
     if [[ "$force" -eq 1 ]]; then
@@ -508,6 +579,9 @@ shim_entry() {
 # something foreign sits in agy's place — we leave it alone
 restore_entry() {
   local target; target="$(resolve_link "$1")"
+  if [[ -n "$(wrapper_field "$1" 2)" ]] || is_launcher "$target"; then
+    unwrap_entry "$1"; return
+  fi
   [[ -f "$target.real" ]] || return 0
   if [[ ! -e "$target" ]] || is_our_shim "$target"; then
     mv -f "$target.real" "$target" || { echo "FAILED to restore $target"; return 1; }
@@ -565,6 +639,7 @@ chmod 644 "$PREFIX/common.sh"
 ACTION=heal; ENTRY=""
 case "${1:-}" in
   --place)   ACTION=place;   ENTRY="${2:?}" ;;
+  --restore-entry) ACTION=restore-one; ENTRY="${2:?}" ;;
   --restore) ACTION=restore ;;
   --worker)  ACTION="worker:${2:?}"; ENTRY="${3:-}" ;;   # internal: work as the owner
 esac
@@ -583,9 +658,19 @@ fi
 
 # --- layer under the lock ---
 run_entry() {   # $1 = heal|place|restore, $2 = entry; prints the log, returns the operation's code
-  local action="$1" entry="$2" target mode out rc
+  local action="$1" entry="$2" target mode out rc wrapper
   target="$(resolve_link "$entry")"
-  mode="$(entry_mode "$entry" "$target")"
+  wrapper="$(wrapper_field "$entry" 2)"
+  if [[ -n "$wrapper" ]]; then
+    # Wrapper paths and their parents belong to the user and can become symlinks.
+    # Never fall back to root just because their new target is root-writable only.
+    target="$wrapper"; mode=self
+    if [[ -n "$(owner_user)" ]]; then
+      if can_drop_privileges; then mode=owner; else mode=refuse; fi
+    fi
+  else
+    mode="$(entry_mode "$entry" "$target")"
+  fi
   case "$mode" in
     owner)  out="$(drop_to_owner env AGY_HEAL_LOCKED=1 bash "$SELF" --worker "$action" "$entry" 2>&1)"; rc=$? ;;
     refuse) out="[heal] refused: $entry -> $target — only root can write there, but the path is user-controlled"; rc=1 ;;
@@ -602,6 +687,9 @@ locked_main() {
   local entry rc=0
   if [[ "$ACTION" == place ]]; then
     run_entry place "$ENTRY"; exit $?
+  fi
+  if [[ "$ACTION" == restore-one ]]; then
+    run_entry restore "$ENTRY"; exit $?
   fi
   [[ -f "$PREFIX_SH/shim.path" ]] || exit 0
   while IFS= read -r entry; do
@@ -633,21 +721,154 @@ if [[ "$OS" == "Linux" ]]; then
   printf '%s\n' "${SUDO_USER:-$(id -un)}" > "$PREFIX/owner"
   chmod 644 "$PREFIX/owner"
 fi
-AGY_BIN="${AGY_BYPASS_BIN:-$(command -v agy || true)}"
-# under sudo, PATH may not contain the user's ~/.local/bin — look there too
-if [[ -z "$AGY_BIN" && -n "${SUDO_USER:-}" ]]; then
-  for CAND in "/home/$SUDO_USER/.local/bin/agy" "/home/$SUDO_USER/bin/agy"; do
-    [[ -x "$CAND" ]] && AGY_BIN="$CAND" && break
-  done
+# --- finding agy -------------------------------------------------------------
+# Under sudo the PATH is replaced by secure_path, which hides what the user actually runs
+# (~/.local/bin, /snap/bin, nvm, bun, cargo...). So we look the way the owner's shell does.
+OWNER_CMD=()   # command prefix that runs something as the owner (empty: we already are)
+OWNER_NAME="$(owner_user)"
+if [[ -n "$OWNER_NAME" ]]; then
+  if command -v runuser >/dev/null 2>&1; then OWNER_CMD=(runuser -u "$OWNER_NAME" --)
+  elif command -v setpriv >/dev/null 2>&1; then OWNER_CMD=(setpriv --reuid="$OWNER_NAME" --regid="$(id -g "$OWNER_NAME")" --init-groups --)
+  else err "runuser or setpriv is needed to work with $OWNER_NAME's files (util-linux)"; fi
 fi
+run_as_owner() { "${OWNER_CMD[@]+"${OWNER_CMD[@]}"}" "$@"; }
+OWNER_HOME="$HOME"
+[[ -z "$OWNER_NAME" ]] || OWNER_HOME="$(getent passwd "$OWNER_NAME" | cut -d: -f6)"
+[[ -n "$OWNER_HOME" ]] || OWNER_HOME="$HOME"
+
+# the owner's PATH as an interactive login shell sees it (rc files may print noise: take a marked line)
+OWNER_PATH=""
+if [[ -n "$OWNER_NAME" ]]; then
+  OWNER_PATH="$(run_with_timeout 15 "${OWNER_CMD[@]}" env -i HOME="$OWNER_HOME" USER="$OWNER_NAME" TERM=dumb \
+    bash -lic 'printf "\n@@AGYPATH@@%s@@\n" "$PATH"' </dev/null 2>/dev/null \
+    | sed -n 's/^@@AGYPATH@@\(.*\)@@$/\1/p' | tail -n 1 || true)"
+fi
+OWNER_PATH="${OWNER_PATH:+$OWNER_PATH:}$PATH"
+
+# every directory that may hold agy, most likely first: the owner's PATH, then well-known places
+agy_search_dirs() {
+  local d
+  { printf '%s\n' "$OWNER_PATH" | tr ':' '\n'
+    for d in "$OWNER_HOME/.local/bin" "$OWNER_HOME/bin" "$OWNER_HOME/.bun/bin" "$OWNER_HOME/.cargo/bin" \
+             "$OWNER_HOME/.npm-global/bin" "$OWNER_HOME/.volta/bin" "$OWNER_HOME/.nix-profile/bin" \
+             "$OWNER_HOME"/.nvm/versions/node/*/bin /snap/bin /usr/local/bin /usr/bin /opt/homebrew/bin \
+             /home/linuxbrew/.linuxbrew/bin; do printf '%s\n' "$d"; done
+  } | awk 'NF && !seen[$0]++'
+}
+
+# the agy the user would run. Our own wrapper (a shim with no agy.real beside it) is skipped:
+# on a re-install it precedes the launcher in PATH and must not be taken for the program itself
+find_agy() {
+  local d c
+  if [[ -n "${AGY_BYPASS_BIN:-}" ]]; then printf '%s\n' "$AGY_BYPASS_BIN"; return; fi
+  while IFS= read -r d; do
+    c="$d/agy"
+    [[ -f "$c" && -x "$c" ]] || continue
+    if is_our_shim "$(resolve_link "$c")" && [[ ! -e "$(resolve_link "$c").real" ]]; then continue; fi
+    printf '%s\n' "$c"; return
+  done < <(agy_search_dirs)
+}
+
+# a directory for the wrapper: it must come BEFORE the launcher in the owner's PATH, belong to the
+# owner, and not be a system directory. ~/.local/bin is preferred; otherwise it is created
+pick_wrapper_path() {   # $1 = launcher entry
+  local entry="$1" dir preferred="" first=""
+  while IFS= read -r dir; do
+    [[ "$dir" == "$(dirname "$entry")" ]] && break          # what follows loses to the launcher
+    [[ -d "$dir" ]] && run_as_owner test -w "$dir" || continue
+    case "$dir" in "$OWNER_HOME"/*) ;; *) continue ;; esac
+    if [[ "$dir" == "$OWNER_HOME/.local/bin" ]]; then preferred="$dir"; break; fi
+    [[ -n "$first" ]] || first="$dir"
+  done < <(printf '%s\n' "$OWNER_PATH" | tr ':' '\n' | awk 'NF && !seen[$0]++')
+  dir="${preferred:-$first}"
+  if [[ -z "$dir" ]]; then
+    dir="$OWNER_HOME/.local/bin"
+    run_as_owner mkdir -p "$dir" || return 1
+  fi
+  printf '%s/%s\n' "$dir" "$(basename "$entry")"
+}
+
+# where the confined application can read the CA: a snap sees only its own ~/snap/<name>/common
+# (and non-hidden files in $HOME); anything else reads the prefix directly
+wrapper_ca_dir() {   # $1 = launcher entry, $2 = its resolved target
+  local link name snap
+  case "$2" in
+    /usr/lib/snapd/*|/usr/bin/snap|/snap/*|/var/lib/snapd/*)
+      link="$(readlink "$1" 2>/dev/null || true)"; name="$(basename "${link:-$1}")"; snap="${name%%.*}"
+      if [[ -d "$OWNER_HOME/snap/$snap" ]]; then printf '%s\n' "$OWNER_HOME/snap/$snap/common/agy-region-fixer"; return; fi ;;
+  esac
+  printf '%s\n' "$CA_DIR"
+}
+
+forget_shim_path() {
+  local entry="$1" tmp
+  tmp="$(mktemp "$PREFIX/shim.path.XXXXXX")" || err "could not update shim.path"
+  if awk -v e="$entry" '$0 != e' "$PREFIX/shim.path" > "$tmp" && mv -f "$tmp" "$PREFIX/shim.path"; then
+    chmod 644 "$PREFIX/shim.path"
+  else rm -f "$tmp"; err "could not update shim.path"; fi
+}
+
+# Missing launchers must not leave their wrappers ahead of a replacement CLI in PATH.
+# Removal uses the same lock and owner privileges as heal, including for a vanished Nix profile.
+prune_missing_wrappers() {
+  local entry wrapper ca_dir tmp
+  [[ -f "$WRAPPERS_FILE" ]] || return 0
+  while IFS=$'\t' read -r entry wrapper ca_dir; do
+    [[ -n "$entry" && ! -e "$entry" ]] || continue
+    "$PREFIX/heal.sh" --restore-entry "$entry" || err "could not remove the stale wrapper for $entry"
+    forget_shim_path "$entry"
+    tmp="$(mktemp "$WRAPPERS_FILE.XXXXXX")" || err "could not update wrappers.path"
+    if awk -F'\t' -v e="$entry" '$1 != e' "$WRAPPERS_FILE" > "$tmp" && mv -f "$tmp" "$WRAPPERS_FILE"; then
+      chmod 644 "$WRAPPERS_FILE"
+    else rm -f "$tmp"; err "could not update wrappers.path"; fi
+  done < "$WRAPPERS_FILE"
+}
+
+register_wrapper() {   # $1 entry, $2 wrapper, $3 CA dir; one owner per entry and wrapper
+  local old_entry old_wrapper old_ca
+  case "$1$2$3" in *$'\t'* | *$'\n'*) err "tabs and newlines in agy paths are not supported" ;; esac
+  if [[ -f "$WRAPPERS_FILE" ]]; then
+    while IFS=$'\t' read -r old_entry old_wrapper old_ca; do
+      [[ "$old_entry" == "$1" || "$old_wrapper" == "$2" ]] || continue
+      "$PREFIX/heal.sh" --restore-entry "$old_entry" || err "could not replace the wrapper for $old_entry"
+      [[ "$old_entry" == "$1" ]] || forget_shim_path "$old_entry"
+    done < "$WRAPPERS_FILE"
+  fi
+  { awk -F'\t' -v e="$1" -v w="$2" '$1 != e && $2 != w' "$PREFIX/wrappers.path" 2>/dev/null || true
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3"; } > "$PREFIX/wrappers.path.tmp"
+  mv -f "$PREFIX/wrappers.path.tmp" "$PREFIX/wrappers.path"; chmod 644 "$PREFIX/wrappers.path"
+}
+
+prune_missing_wrappers
+AGY_BIN="$(find_agy || true)"
+WRAPPER_NEEDS_PATH=0; SMOKE_BIN="${AGY_BIN:-}"
 if [[ -n "$AGY_BIN" ]]; then
   # shim.path holds the path under which agy is visible in PATH (may be a symlink):
   # heal resolves it on every run, so switching the link to a new
   # version (brew/npm) does not go unnoticed
   RESOLVED="$(resolve_link "$AGY_BIN")"
-  [[ "$RESOLVED" == "$AGY_BIN" ]] || say "agy is a symlink ($AGY_BIN -> $RESOLVED): placing the shim next to the real binary"
+  if is_launcher "$RESOLVED"; then
+    # snap/nix: the launcher cannot be replaced — a wrapper earlier in the user's PATH does the job
+    WRAP_PATH="$(pick_wrapper_path "$AGY_BIN")" || err "could not prepare a directory for the wrapper"
+    # pick_wrapper_path runs in a subshell: decide PATH precedence here, in the installer.
+    WRAPPER_DIR="$(dirname "$WRAP_PATH")"
+    WRAPPER_NEEDS_PATH=1
+    while IFS= read -r SEARCH_DIR; do
+      if [[ "$SEARCH_DIR" == "$WRAPPER_DIR" ]]; then WRAPPER_NEEDS_PATH=0; break; fi
+      [[ "$SEARCH_DIR" != "$(dirname "$AGY_BIN")" ]] || break
+    done < <(printf '%s\n' "$OWNER_PATH" | tr ':' '\n')
+    register_wrapper "$AGY_BIN" "$WRAP_PATH" "$(wrapper_ca_dir "$AGY_BIN" "$RESOLVED")"
+    say "agy is a launcher ($AGY_BIN -> $RESOLVED): not touching it, installing a wrapper $WRAP_PATH"
+    SMOKE_BIN="$WRAP_PATH"
+  else
+    [[ "$RESOLVED" == "$AGY_BIN" ]] || say "agy is a symlink ($AGY_BIN -> $RESOLVED): placing the shim next to the real binary"
+  fi
   grep -qxF "$AGY_BIN" "$PREFIX/shim.path" 2>/dev/null || printf '%s\n' "$AGY_BIN" >> "$PREFIX/shim.path"
   "$PREFIX/heal.sh" --place "$AGY_BIN" || err "failed to install the shim for $AGY_BIN (details above and in $PREFIX/mitm.log)"
+  if [[ "$WRAPPER_NEEDS_PATH" -eq 1 ]]; then
+    say "⚠️  $(dirname "$WRAP_PATH") is not in your PATH ahead of $(dirname "$AGY_BIN"): add this to your shell profile"
+    say "    export PATH=\"$(dirname "$WRAP_PATH"):\$PATH\""
+  fi
 else
   say "agy not found in PATH — not installing the shim. Install Antigravity CLI and rerun the installer."
 fi
@@ -656,11 +877,16 @@ fi
 say "5/6 Shim self-healing after CLI updates (instant + every 5 minutes)"
 # what the path units/WatchPaths should watch: the path from shim.path and its resolved target (no duplicates)
 watch_targets() {
-  local p r
+  local p r w
   while IFS= read -r p; do
     [[ -n "$p" ]] || continue
-    printf '%s\n' "$p"
     r="$(resolve_link "$p")"
+    if is_launcher "$r"; then
+      # the launcher is never modified: what can disappear or be overwritten is our wrapper
+      w="$(wrapper_field "$p" 2)"; [[ -z "$w" ]] || printf '%s\n' "$w"
+      continue
+    fi
+    printf '%s\n' "$p"
     [[ "$r" == "$p" ]] || printf '%s\n' "$r"
   done < "$PREFIX/shim.path" | awk '!seen[$0]++'
 }
@@ -783,18 +1009,29 @@ UNISTEOF
 chmod 755 "$PREFIX/uninstall.sh"
 
 # --- smoke test through agy, if it exists and is logged in ---
-if [[ -n "${AGY_BIN:-}" ]] && [[ -f "$(resolve_link "$AGY_BIN")" ]]; then
+smoke_succeeded() {
+  [[ "$1" -eq 0 ]] || return 1
+  # Ignore terminal colours, but never accept an echoed prompt containing the token.
+  sed -E $'s/\033\\[[0-?]*[ -/]*[@-~]//g' "$2" | grep -E '^[[:space:]]*BYPASS_OK[[:space:]]*$' >/dev/null
+}
+if [[ -n "${AGY_BIN:-}" ]] && { [[ -f "$(resolve_link "$AGY_BIN")" ]] || is_launcher "$(resolve_link "$AGY_BIN")"; }; then
   say "Smoke test: agy -p (up to 120 s)"
-  # output goes to a file, not a pipe: agy child processes holding a pipe will not extend the wait
+  # output goes to a file, not a pipe: agy child processes holding a pipe will not extend the wait.
+  # It runs as the owner: that is who is logged in to agy (root has no credentials of its own)
   SMOKE_OUT="$(mktemp)"
-  run_with_timeout 120 "$AGY_BIN" -p 'Reply exactly: BYPASS_OK' </dev/null >"$SMOKE_OUT" 2>&1 || true
+  SMOKE_STATUS=0
+  if [[ -n "$OWNER_NAME" ]]; then
+    run_with_timeout 120 "${OWNER_CMD[@]}" env "PATH=$(dirname "$SMOKE_BIN"):$OWNER_PATH" "$SMOKE_BIN" -p 'Reply exactly: BYPASS_OK' </dev/null >"$SMOKE_OUT" 2>&1 || SMOKE_STATUS=$?
+  else
+    run_with_timeout 120 "$SMOKE_BIN" -p 'Reply exactly: BYPASS_OK' </dev/null >"$SMOKE_OUT" 2>&1 || SMOKE_STATUS=$?
+  fi
   OUT="$(tail -n 1 "$SMOKE_OUT" 2>/dev/null || true)"
-  if grep -q BYPASS_OK "$SMOKE_OUT" 2>/dev/null; then
-    say "✅ Model reply: $OUT — the bypass works"
+  if smoke_succeeded "$SMOKE_STATUS" "$SMOKE_OUT"; then
+    say "✅ Model reply: BYPASS_OK — the bypass works"
   else
     say "⚠️  agy did not reply BYPASS_OK: $OUT"
     say "    if 'not logged in' — run agy login and just use it;"
-    say "    if eligibility — check the log: $PREFIX/mitm.log"
+    say "    if eligibility — enable the diagnostic: touch $PREFIX/verbose.flag, run agy once, read $PREFIX/mitm.log"
   fi
   rm -f "$SMOKE_OUT"
 fi

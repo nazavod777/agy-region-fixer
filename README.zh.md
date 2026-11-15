@@ -88,6 +88,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://raw.git
 
 - 🐍 Python **3.12 或 3.13**（mitmproxy 12.x 的要求），且须为包含 `ctypes`、`ssl`、`zlib` 的完整构建。安装脚本会检查 `PATH` 中所有 `python3.13`/`python3.12`/`python3`，并跳过不完整的版本（例如未安装 `libffi-dev` 就从源码编译的 Python）
 - 🌐 `curl`，以及已安装并登录的 Antigravity CLI
+- 📦 **任何方式安装的 `agy`** —— 安装脚本像你自己的 shell 一样查找它（`sudo` 会隐藏 `~/.local/bin`、`/snap/bin`、nvm、bun、cargo 等）：
+  - 普通二进制文件、npm/brew/cargo 的链接、root 所有的 `/usr/local/bin/agy` → 二进制文件被移到 `agy.real`，由 shim 取代；
+  - **snap、Nix**（不能改动的启动器）→ 启动器保持原样，在你的 `PATH` 中更靠前的位置（`~/.local/bin`）放置一个包装脚本。对于 snap，CA 证书会复制到 `~/snap/<名称>/common/agy-region-fixer`，受限应用可以读取该目录。
 - 🐧 Linux：systemd，以及 `runuser` 或 `setpriv`（都包含在 `util-linux` 中）
 
 ## ⚙️ 工作原理
@@ -179,8 +182,13 @@ $env:AGY_BYPASS_PORT="8081"; powershell -ExecutionPolicy Bypass -File install.ps
 
 🔎 **详细模式：** 在安装目录中创建 `verbose.flag` 文件即可记录所有 URL（`touch /opt/agy-region-fixer/verbose.flag`；Windows 上在 `%USERPROFILE%\.agy-region-fixer` 中创建该文件）。无需重启代理 —— 每个请求都会检查该文件；删除文件即可关闭。
 
+🔬 详细模式下，插件还会记录 Google 每个 JSON 响应的**结构**（`SHAPE <方法> <url> <状态> -> {字段: 类型}`）：只记录字段名和类型，不记录值（`reasonCode`、`tierId` 等枚举除外）。如果安装后警告仍在，这些行可以显示 API 是否变化 —— 请把 `SHAPE` 行附在 issue 中。
+
+如果代理正在监听端口，但警告仍然存在，请检查安装目录中的 `addon.py` 是否存在，以及服务日志中是否出现 `Un-loading script`。在代理运行时删除安装目录会卸载插件，即使 HTTPS 流量仍能通过。重新运行安装脚本可恢复文件并重启代理；需要删除时请使用卸载脚本。
+
 ## ⚠️ 限制
 
+- 🪟 Windows：只有 `PATH` 中普通的 `agy.exe` 才会安装 shim。对于 npm 的 `.cmd`、WindowsApps 别名或 scoop shim，安装脚本会报告找到了什么，并给出手动通过代理运行 `agy` 的命令。
 - 🪟 Windows：shim 是 `agy.cmd`。通过 CreateProcess 严格调用 `agy.exe`（绕过 `PATHEXT` 解析）的程序看不到它。CLI 和 PowerShell 正常工作。
 - 🧬 如果 Google 更改响应格式（字段改名或改用二进制 proto），插件将停止清理；在 `addon.py` 中改一行即可修复。
 - 📌 如果 `agy` 启用证书固定（Go 客户端几乎从不这样做），此方案需要重做。

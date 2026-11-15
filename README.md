@@ -88,6 +88,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://raw.git
 
 - 🐍 Python **3.12 or 3.13** (required by mitmproxy 12.x), a complete build with `ctypes`, `ssl` and `zlib`. The installer checks every `python3.13`/`python3.12`/`python3` on `PATH` and skips incomplete ones — e.g. a self-built Python without `libffi-dev`
 - 🌐 `curl`, and an installed, logged-in Antigravity CLI
+- 📦 **Any way of installing `agy`** — the installer finds it the way your own shell does (`sudo` hides `~/.local/bin`, `/snap/bin`, nvm, bun, cargo…):
+  - a plain binary, an npm/brew/cargo link, a root-owned `/usr/local/bin/agy` → the binary is moved to `agy.real` and replaced by the shim;
+  - **snap, Nix** (a launcher that must not be touched) → the launcher stays as is, and a wrapper is placed earlier in your `PATH` (`~/.local/bin`). For a snap the CA certificate is copied into `~/snap/<name>/common/agy-region-fixer`, where the confined app can read it.
 - 🐧 Linux: systemd plus `runuser` or `setpriv` (both ship in `util-linux`)
 
 ## ⚙️ How it works
@@ -179,8 +182,13 @@ Removes the proxy, tasks and shim; the `agy` binary goes back in place — even 
 
 🔎 **Verbose mode:** logging every URL is switched on with a `verbose.flag` file in the install directory (`touch /opt/agy-region-fixer/verbose.flag`; on Windows create the file in `%USERPROFILE%\.agy-region-fixer`). No proxy restart needed — the flag is checked on every request; delete the file to turn it off.
 
+🔬 In verbose mode the addon also logs the **shape** of every JSON answer from Google (`SHAPE <method> <url> <status> -> {field: type}`): field names and types only, never values (except enumerations such as `reasonCode` and `tierId`). If the warning stays after installing, this is what shows whether the API changed — attach the `SHAPE` lines to an issue.
+
+If the proxy is listening but the warning remains, check that `addon.py` still exists in the install directory and the service log has no `Un-loading script` entry. Deleting the directory while the proxy is running unloads the addon, even though HTTPS traffic still passes through. Rerun the installer to restore the files and restart the proxy; use the uninstall script when removing it.
+
 ## ⚠️ Limitations
 
+- 🪟 Windows: only a plain `agy.exe` in `PATH` gets the shim. An npm `.cmd`, a WindowsApps alias or a scoop shim is detected and reported, with the command to run `agy` through the proxy by hand.
 - 🪟 Windows: the shim is `agy.cmd`. Consumers that call `agy.exe` strictly via CreateProcess (bypassing `PATHEXT` resolution) will not see it. The CLI and PowerShell work.
 - 🧬 If Google changes the response format (renames the field or moves to binary proto) the addon stops cleaning; fixed with a one-line change in `addon.py`.
 - 📌 If `agy` starts certificate pinning (Go clients almost never do) this approach would need rework.
