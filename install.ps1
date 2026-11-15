@@ -77,29 +77,61 @@ New-Item -ItemType Directory -Force -Path $PREFIX, $CA_DIR | Out-Null
 Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
 $venvDir  = Join-Path $PREFIX "venv"
 $venvMitm = Join-Path $venvDir "Scripts\mitmdump.exe"
+$venvPrev = "$venvDir.prev"
 $pinVersion = $PIN.Split("=")[-1]
-function Get-MitmVersion {
-  try { $o = (& $venvMitm --version 2>&1 | Out-String); if ($LASTEXITCODE -eq 0) { return $o } } catch {}
-  return $null
+# output of "mitmdump --version" as text plus its exit status. "Continue" is local to the
+# function: under "Stop", Windows PowerShell 5.1 turns the first redirected stderr line
+# into a terminating error and the real message (e.g. ModuleNotFoundError) is lost
+function Invoke-MitmVersion {
+  $ErrorActionPreference = "Continue"
+  if (-not (Test-Path -LiteralPath $venvMitm)) { return @{ Ok = $false; Text = "mitmdump.exe is missing" } }
+  try {
+    $text = (& $venvMitm --version 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    return @{ Ok = ($LASTEXITCODE -eq 0); Text = $text }
+  } catch { return @{ Ok = $false; Text = "$_" } }
 }
-# a venv from a failed or older install is rebuilt, otherwise every re-run fails the same way
-if ((Test-Path $venvDir) -and -not ("$(Get-MitmVersion)" -like "*$pinVersion*")) {
+# exact "Mitmproxy: X.Y.Z" line: a substring would accept 12.3.10 for 12.3.1
+function Test-MitmWorks {
+  $r = Invoke-MitmVersion
+  return ($r.Ok -and ($r.Text -match "(?m)^Mitmproxy:\s*$([regex]::Escape($pinVersion))\s*$"))
+}
+# OUR proxy copies only (re-install); a running mitmdump.exe locks the venv files
+function Stop-OurProxy {
+  Get-CimInstance Win32_Process -Filter "Name='mitmdump.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like "*$PREFIX*" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  Start-Sleep 1
+}
+# a failed rebuild puts the previous venv back: an outdated but working one must survive
+function Stop-VenvSetup($message) {
+  if (Test-Path -LiteralPath $venvPrev) {
+    if (Test-Path -LiteralPath $venvDir) { Remove-Item -LiteralPath $venvDir -Recurse -Force -ErrorAction SilentlyContinue }
+    Rename-Item -LiteralPath $venvPrev -NewName (Split-Path $venvDir -Leaf) -ErrorAction SilentlyContinue
+  }
+  Die $message
+}
+# a venv from a failed or older install is rebuilt, otherwise every re-run fails the same way.
+# It is set aside, not deleted, until the new one works
+if (Test-Path -LiteralPath $venvPrev) { Remove-Item -LiteralPath $venvPrev -Recurse -Force }
+if ((Test-Path -LiteralPath $venvDir) -and -not (Test-MitmWorks)) {
   Say "the existing venv is broken or outdated - rebuilding it"
-  Remove-Item -LiteralPath $venvDir -Recurse -Force
+  Stop-OurProxy
+  Rename-Item -LiteralPath $venvDir -NewName (Split-Path $venvPrev -Leaf)
 }
-if (-not (Test-Path $venvMitm)) {
-  & $py -m venv (Join-Path $PREFIX "venv")
-  if ($LASTEXITCODE -ne 0) { Die "failed to create venv" }
-  $pip = Join-Path $PREFIX "venv\Scripts\pip.exe"
+if (-not (Test-Path -LiteralPath $venvMitm)) {
+  & $py -m venv $venvDir
+  if ($LASTEXITCODE -ne 0) { Stop-VenvSetup "failed to create venv" }
+  $pip = Join-Path $venvDir "Scripts\pip.exe"
   & $pip install --quiet --upgrade pip
   & $pip install --quiet $PIN
-  if ($LASTEXITCODE -ne 0) { Die "failed to install mitmproxy" }
+  if ($LASTEXITCODE -ne 0) { Stop-VenvSetup "failed to install mitmproxy (check the network and access to pypi.org)" }
 }
 # catch "pip said OK but the environment is broken" (happened on python 3.14: no pyparsing)
-if (-not ("$(Get-MitmVersion)" -like "*$pinVersion*")) {
-  $why = try { (& $venvMitm --version 2>&1 | Select-Object -Last 2) -join " " } catch { "$_" }
-  Die "mitmproxy does not start with $(& $py --version): $why"
+if (-not (Test-MitmWorks)) {
+  $why = ((Invoke-MitmVersion).Text -split "`n" | Select-Object -Last 2) -join " "
+  Stop-VenvSetup "mitmproxy does not start with $(& $py --version): $why"
 }
+if (Test-Path -LiteralPath $venvPrev) { Remove-Item -LiteralPath $venvPrev -Recurse -Force -ErrorAction SilentlyContinue }
 
 # --- addon -----------------------------------------------------------------
 Say "2/6 Addon: strips ineligibleTiers from Google responses"
@@ -127,10 +159,7 @@ WriteBom (Join-Path $PREFIX "run-proxy.ps1") $runPs1
 # --- autostart: HKCU Run (no admin) + immediate start ----------------------
 Say "3/6 Proxy autostart (HKCU Run, port 127.0.0.1:$PORT)"
 # stop OUR old proxy copies (re-install) — leave others alone
-Get-CimInstance Win32_Process -Filter "Name='mitmdump.exe'" -ErrorAction SilentlyContinue |
-  Where-Object { $_.CommandLine -like "*$PREFIX*" } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Start-Sleep 1
+Stop-OurProxy
 
 # is the port taken by something other than us? (after killing our copies it must be free)
 # a real TCP probe instead of curl exit codes

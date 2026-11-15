@@ -67,12 +67,14 @@ fi
 # source without dev headers lacks stdlib C modules, and mitmdump crashes at start
 # ("No module named '_ctypes'"). Without these three it never starts (measured on
 # mitmproxy 12.3.1); anything else is caught by checking the finished venv.
-PY_REQUIRED_MODULES="ctypes ssl zlib"
+# an array, not a string: bash 3.2 applies a temporary IFS (see `IFS=$'\t' read` below)
+# inside process substitution, so a word-split string would arrive as one argument
+PY_REQUIRED_MODULES=(ctypes ssl zlib)
 PY_DEV_HINT="Debian/Ubuntu: apt install python3.12 python3.12-venv; macOS: brew install python@3.12 (or xcode-select --install); a self-built Python needs libffi-dev libssl-dev zlib1g-dev before ./configure"
 
 # prints "OK<TAB>realpath" if the interpreter fits, otherwise "NO<TAB>reason"
 python_check() {
-  "$1" - $PY_REQUIRED_MODULES 2>/dev/null <<'PYCHECK' || printf 'NO\tdoes not run\n'
+  "$1" - "${PY_REQUIRED_MODULES[@]}" 2>/dev/null <<'PYCHECK' || printf 'NO\tdoes not run\n'
 import os, sys
 v = sys.version_info
 if not (3, 12) <= v[:2] < (3, 14):
@@ -99,6 +101,7 @@ for PY_NAME in python3.13 python3.12 python3; do
   while IFS= read -r PY_PATH; do
     [[ -n "$PY_PATH" ]] || continue
     IFS=$'\t' read -r PY_STATUS PY_INFO < <(python_check "$PY_PATH") || PY_STATUS=""
+    [[ -n "$PY_INFO" ]] || PY_INFO="printed nothing"
     if [[ "$PY_STATUS" == OK ]]; then
       [[ "$PY_SEEN" == *$'\n'"$PY_INFO"$'\n'* ]] && continue
       PY_SEEN="$PY_SEEN$PY_INFO"$'\n'
@@ -148,7 +151,9 @@ venv_works() {
   local out
   [[ -x "$VENV/bin/mitmdump" ]] || return 1
   out="$("${CLEAN_ENV[@]}" "$VENV/bin/mitmdump" --version 2>&1)" || { printf '%s\n' "$out" >> "$PY_LOG"; return 1; }
-  [[ "$out" == *"$AGY_PIN_VERSION"* ]] || { printf 'outdated: %s\n' "$out" >> "$PY_LOG"; return 1; }
+  # exact match of the "Mitmproxy: X.Y.Z" line: a substring would accept 12.3.10 for 12.3.1
+  [[ "$(printf '%s\n' "$out" | awk '$1 == "Mitmproxy:" { print $2; exit }')" == "$AGY_PIN_VERSION" ]] \
+    || { printf 'outdated: %s\n' "$out" >> "$PY_LOG"; return 1; }
 }
 
 # the distro splits the venv module into a separate package (Debian/Ubuntu: python3.X-venv)
@@ -164,13 +169,15 @@ install_venv_package() {
 
 # builds the venv from scratch with interpreter $1; 0 only if mitmdump works in it
 build_venv() {
-  local py="$1" ver
+  local py="$1" ver real
   ver="$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+  real="$("$py" -c 'import os, sys; print(os.path.realpath(sys.executable))')"
   rm -rf "$VENV"
   if ! "${CLEAN_ENV[@]}" "$py" -m venv "$VENV" >> "$PY_LOG" 2>&1; then
     rm -rf "$VENV"
-    # a package manager only helps the distro's own interpreter, not a /usr/local build
-    [[ "$py" == /usr/bin/* ]] || return 1
+    # a package manager only helps the distro's own interpreter, not a /usr/local build;
+    # the real path, because merged-/usr systems also expose it as /bin/python3.X
+    [[ "$real" == /usr/bin/* ]] || return 1
     say "python -m venv failed for $py — installing the venv package with the package manager"
     install_venv_package "$ver" >> "$PY_LOG" 2>&1 || return 1
     "${CLEAN_ENV[@]}" "$py" -m venv "$VENV" >> "$PY_LOG" 2>&1 || return 1
@@ -184,8 +191,14 @@ if venv_works; then
   say "venv with mitmproxy $AGY_PIN_VERSION is already in place — reusing it"
 else
   # a venv left by a failed or older install is rebuilt: otherwise every re-run
-  # would hit the same broken environment
-  [[ ! -e "$VENV" ]] || say "the existing venv is broken or outdated — rebuilding it"
+  # would hit the same broken environment. It is set aside, not deleted, until the new
+  # one works: an outdated but working venv must survive a failed rebuild (no network)
+  VENV_PREV="$VENV.prev"
+  rm -rf "$VENV_PREV"
+  if [[ -e "$VENV" ]]; then
+    say "the existing venv is broken or outdated — rebuilding it"
+    mv "$VENV" "$VENV_PREV"
+  fi
   if [[ -n "$PY_REJECTED" ]]; then
     say "skipped interpreters:"; printf '%s' "$PY_REJECTED"
   fi
@@ -198,14 +211,25 @@ else
   done
   if [[ $VENV_OK -ne 1 ]]; then
     rm -rf "$VENV"
+    # same path as before, so the old venv's scripts keep working after the move back
+    [[ ! -e "$VENV_PREV" ]] || { mv "$VENV_PREV" "$VENV"; say "the previous venv is put back unchanged"; }
     {
-      echo "no usable Python 3.12/3.13 found:"
-      if [[ -n "$PY_REJECTED" ]]; then printf '%s' "$PY_REJECTED"
-      else echo "  - no python3.13 / python3.12 / python3 on PATH"; fi
+      if [[ ${#PY_CANDIDATES[@]} -eq 0 ]]; then
+        echo "no usable Python 3.12/3.13 found:"
+        if [[ -n "$PY_REJECTED" ]]; then printf '%s' "$PY_REJECTED"
+        else echo "  - no python3.13 / python3.12 / python3 on PATH"; fi
+      else
+        echo "a suitable Python was found, but venv/pip could not set up mitmproxy $AGY_PIN_VERSION:"
+        printf '%s' "$PY_REJECTED"
+      fi
       if [[ -s "$PY_LOG" ]]; then echo "last lines of $PY_LOG:"; tail -n 8 "$PY_LOG"; fi
     } >&2
-    err "install a complete Python 3.12/3.13 — $PY_DEV_HINT"
+    if [[ ${#PY_CANDIDATES[@]} -eq 0 ]]; then
+      err "install a complete Python 3.12/3.13 — $PY_DEV_HINT"
+    fi
+    err "check the network and access to pypi.org (the log above has pip's error), then re-run"
   fi
+  rm -rf "$VENV_PREV"
 fi
 PYBIN="$VENV/bin/python"   # a verified interpreter for the remaining install steps
 
@@ -466,6 +490,11 @@ shim_entry() {
         # not a binary: unfinished update or garbage — do NOT overwrite agy.real
         echo "[heal] suspicious $target (size=$size < $MIN_REAL_BYTES) — left as is"; return 0
       fi
+      # the entry may have been switched during the wait (e.g. agy replaced by a symlink):
+      # the mv below would then move the new link into agy.real. The change re-triggers heal
+      if [[ -L "$target" || "$(resolve_link "$entry")" != "$target" ]]; then
+        echo "[heal] $entry changed while waiting — left for the next run"; return 0
+      fi
     fi
     mv -f "$target" "$target.real" || { echo "[heal] FAILED to move $target"; return 1; }
   fi
@@ -641,6 +670,11 @@ if [[ "$OS" == "Linux" ]]; then
   cat > /etc/systemd/system/agy-region-fixer-heal.service <<UNIT2
 [Unit]
 Description=Restore agy region-fixer shim after CLI updates
+# no start rate limit: with the default (5 starts in 10 s) a burst of writes to agy
+# fails the service with start-limit-hit, and the path unit fails with it until reboot.
+# Heal is an idempotent oneshot without Restart= and writes nothing once the shim is
+# in place, so it cannot loop on its own triggers
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -682,6 +716,8 @@ UNIT4
     rm -f "$PATH_UNIT"
   fi
   systemctl daemon-reload
+  # a re-install revives units an earlier version left in the failed state
+  systemctl reset-failed agy-region-fixer-heal.service agy-region-fixer-heal.path >/dev/null 2>&1 || true
   systemctl enable --now agy-region-fixer-heal.timer >/dev/null 2>&1 \
     || say "⚠️  failed to enable the heal timer — restore the shim manually after a CLI update: sudo agy-bypass-heal"
   # enable the path unit only if it exists: it is not created when no CLI was found

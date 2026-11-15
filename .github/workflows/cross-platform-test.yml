@@ -62,14 +62,16 @@ jobs:
             # GH runner is not root; sudo is passwordless but -E is ignored by it — pass PATH and port explicitly
             sudo env "PATH=$PATH" "AGY_BYPASS_PORT=$AGY_BYPASS_PORT" bash install.sh
           else
-            bash install.sh            # macOS: launchd as the user, sudo not needed
+            # macOS: launchd as the user, sudo not needed. /bin/bash is the system bash 3.2
+            # that `curl | bash` gets, not a newer brew bash from PATH
+            /bin/bash install.sh
           fi
         env:
           AGY_BYPASS_PORT: "8090"
 
       - name: Run installer (windows)
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell   # Windows PowerShell 5.1, as in the README
         run: ./install.ps1
         env:
           AGY_BYPASS_PORT: "8090"
@@ -142,10 +144,19 @@ jobs:
           PREFIX="/opt/agy-region-fixer"; [[ "$(uname -s)" == "Darwin" ]] && PREFIX="$HOME/.agy-region-fixer"
           AGY="$HOME/.local/bin/agy"
           if [[ "$(uname -s)" == "Linux" ]]; then
-            systemctl is-active agy-region-fixer-heal.path
+            units() {
+              systemctl status --no-pager agy-region-fixer-heal.path agy-region-fixer-heal.service || true
+              sudo journalctl --no-pager -n 30 -u agy-region-fixer-heal.path -u agy-region-fixer-heal.service || true
+            }
+            systemctl is-active agy-region-fixer-heal.path || { units; exit 1; }
+            # a burst of writes (an updater, a package manager) must not trip the start limit:
+            # with the default 5 starts in 10 s the path unit fails until reboot
+            for _ in $(seq 1 10); do cp "$AGY" "$AGY.w"; mv -f "$AGY.w" "$AGY"; sleep 0.3; done
+            sleep 2
+            systemctl is-active agy-region-fixer-heal.path || { echo "FAIL: path unit died after a burst of writes"; units; exit 1; }
             cp "$AGY.real" "$AGY"          # "an update arrived" — the path unit must fire on its own
             for _ in $(seq 1 25); do grep -q "agy-region-fixer-shim" "$AGY" && break; sleep 1; done
-            grep -q "agy-region-fixer-shim" "$AGY" || { echo "FAIL: path unit did not restore the shim"; exit 1; }
+            grep -q "agy-region-fixer-shim" "$AGY" || { echo "FAIL: path unit did not restore the shim"; units; exit 1; }
           else
             # macOS: instant heal via WatchPaths (functionally exercises the launchd runner)
             grep -q WatchPaths "$HOME/Library/LaunchAgents/com.agy.region-fixer-heal.plist"
