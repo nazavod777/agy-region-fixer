@@ -26,6 +26,11 @@
 # (override: AGY_ADDON_URL=...).
 # ============================================================================
 set -euo pipefail
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+OWNER_PATH_FILE=""
+trap '[[ -z "$OWNER_PATH_FILE" ]] || rm -f "$OWNER_PATH_FILE"' EXIT
 
 OS="$(uname -s)"
 AGY_PIN="mitmproxy==12.3.1"
@@ -44,7 +49,14 @@ elif [[ "$OS" == "Linux" ]]; then
 else
   err "OS $OS is not supported by this script — on Windows use install.ps1"
 fi
-PORT="${AGY_BYPASS_PORT:-8080}"
+PORT="${AGY_BYPASS_PORT:-}"
+if [[ -n "$PORT" ]]; then
+  case "$PORT" in *[!0-9]*) err "AGY_BYPASS_PORT must be a decimal integer from 1 to 65535" ;; esac
+  while [[ "$PORT" == 0* && ${#PORT} -gt 1 ]]; do PORT="${PORT#0}"; done
+  [[ ${#PORT} -le 5 ]] && (( 10#$PORT >= 1 && 10#$PORT <= 65535 )) \
+    || err "AGY_BYPASS_PORT must be a decimal integer from 1 to 65535"
+  PORT="$((10#$PORT))"
+fi
 VENV="$PREFIX/venv"
 CA_DIR="$PREFIX/ca"
 # uninstall.sh removes PREFIX entirely — do not allow the root or the home directory
@@ -112,25 +124,117 @@ for PY_NAME in python3.13 python3.12 python3; do
   done < <(type -ap "$PY_NAME" 2>/dev/null || true)
 done
 
-# honest TCP probe: ANY listening port counts as busy (curl got confused by non-HTTP)
-port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; }
-
 # escape a string for XML (plist): & < > in paths must not break the file
 xml_esc() { sed 's|&|\&amp;|g; s|<|\&lt;|g; s|>|\&gt;|g' <<<"$1"; }
 
-# run a command with a time limit: timeout/gtimeout, and without them (macOS) a watchdog
-# process; the watchdog's stdout/stderr are closed, otherwise a pipe into `| tail` would wait for its sleep
+# Run in a private session: interactive shells must not stop on the caller's terminal.
+# The verified Python works on Linux and macOS without timeout/setsid dependencies.
 run_with_timeout() {
-  local secs="$1"; shift
-  if command -v timeout  >/dev/null 2>&1; then timeout  "$secs" "$@"; return; fi
-  if command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"; return; fi
-  "$@" & local pid=$!
-  ( sleep "$secs"; pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 </dev/null &
-  local watchdog=$! rc=0
-  disown "$watchdog" 2>/dev/null || true   # no "Terminated" message from job control
-  wait "$pid" || rc=$?
-  kill "$watchdog" 2>/dev/null || true
+  local secs="$1" timeout_pid rc=0; shift
+  "$PYBIN" -I -c '
+import os, signal, subprocess, sys, tempfile, time
+cancelled = 0
+def cancel(signum, frame):
+    global cancelled
+    if not cancelled: cancelled = signum
+signal.signal(signal.SIGINT, cancel)
+signal.signal(signal.SIGTERM, cancel)
+signal.signal(signal.SIGHUP, cancel)
+child = subprocess.Popen(sys.argv[2:], start_new_session=True)
+deadline = time.monotonic() + float(sys.argv[1])
+status = 124
+def signal_session(sig):
+    # Shell job control may split one session into several process groups.
+    # Verify session membership before each signal; never target the caller session.
+    def send(pid):
+        try:
+            if os.getsid(pid) == child.pid:
+                os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+    if os.path.isdir("/proc/self"):
+        with os.scandir("/proc") as entries:
+            for entry in entries:
+                if entry.name.isdecimal(): send(int(entry.name))
+    else:
+        # macOS has no /proc; its system ps provides a streamed PID listing.
+        with tempfile.TemporaryFile() as listing:
+            subprocess.run(["/bin/ps", "-A", "-o", "pid="], stdout=listing,
+                           stderr=subprocess.DEVNULL, timeout=2, check=True)
+            listing.seek(0)
+            for line in listing: send(int(line))
+try:
+    while not cancelled:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            status = child.wait(timeout=min(0.2, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            pass
+finally:
+    # Also close pipe-holding descendants after the leader exits. Stopped and
+    # TERM-ignoring children must not defeat cancellation or the deadline.
+    for sig in (signal.SIGTERM, signal.SIGCONT):
+        signal_session(sig)
+    try: child.wait(timeout=1)
+    except subprocess.TimeoutExpired: pass
+    signal_session(signal.SIGKILL)
+    child.wait()
+if cancelled:
+    status = 128 + cancelled
+elif status < 0:
+    status = 128 - status
+sys.exit(status)
+' "$secs" "$@" &
+  timeout_pid=$!
+  # Waiting on our explicit child lets Bash process signals immediately, including
+  # SIGTERM sent only to the installer rather than to the whole terminal group.
+  trap 'trap "" INT TERM HUP; kill -INT "$timeout_pid" 2>/dev/null || true; wait "$timeout_pid" 2>/dev/null || true; exit 130' INT
+  trap 'trap "" INT TERM HUP; kill -TERM "$timeout_pid" 2>/dev/null || true; wait "$timeout_pid" 2>/dev/null || true; exit 143' TERM
+  trap 'trap "" INT TERM HUP; kill -HUP "$timeout_pid" 2>/dev/null || true; wait "$timeout_pid" 2>/dev/null || true; exit 129' HUP
+  wait "$timeout_pid" || rc=$?
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
   return "$rc"
+}
+
+# Keep the timed command in the main shell so its signal traps run immediately.
+# Command substitutions defer the outer shell traps until the entire pipe closes.
+capture_owner_path() {
+  OWNER_PATH_FILE="$(mktemp)"
+  run_with_timeout 15 "$@" </dev/null >"$OWNER_PATH_FILE" 2>/dev/null || true
+  OWNER_PATH="$(sed -n 's/^@@AGYPATH@@\(.*\)@@$/\1/p' "$OWNER_PATH_FILE" | tail -n 1)"
+  rm -f "$OWNER_PATH_FILE"
+  OWNER_PATH_FILE=""
+}
+
+select_proxy_port() {
+  "$PYBIN" -I -c '
+import random, socket, sys
+requested, previous, active = sys.argv[1:]
+def usable(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        try: listener.bind(("127.0.0.1", port)); return True
+        except OSError: return False
+if requested:
+    port = int(requested)
+    if (active == "0" and previous == requested) or usable(port):
+        print(port); sys.exit(0)
+    sys.exit("Requested proxy port %s is busy; choose another AGY_BYPASS_PORT." % port)
+previous = previous.lstrip("0")
+if previous.isascii() and previous.isdecimal() and len(previous) <= 5 and 49152 <= int(previous) <= 65535:
+    port = int(previous)
+    if active == "0" or usable(port):
+        print(port); sys.exit(0)
+for attempt in range(32):
+    port = random.SystemRandom().randint(49152, 65535)
+    if usable(port):
+        print(port); sys.exit(0)
+sys.exit("No free localhost proxy port found in 49152-65535; set AGY_BYPASS_PORT.")
+' "$PORT" "$OLD_PORT" "$SERVICE_ACTIVE"
 }
 
 # ---------------------------------------------------------------------------
@@ -267,20 +371,14 @@ fi
   || err "the generated addon.py does not compile"
 
 # ---------------------------------------------------------------------------
-say "3/6 Proxy autostart (port 127.0.0.1:$PORT)"
-# a port counts as "ours" only if our service is active AND already sits on this same port;
-# otherwise, when reinstalling onto a different port, a foreign listener on the new port would slip
-# past the check because the old service is active (old installs have no port file —
-# for them the previous logic applies: "service active = ours")
-OLD_PORT="$(cat "$PREFIX/port" 2>/dev/null || true)"
-port_is_ours() {  # $1 — is our service running right now? (0/1)
-  [[ "$1" -eq 0 ]] && [[ -z "$OLD_PORT" || "$OLD_PORT" == "$PORT" ]]
-}
+say "3/6 Proxy autostart (selecting a localhost port)"
+# Reuse only an active service's recorded high port; fresh installs and busy stale
+# ports use a random bindable port. An explicit override never silently changes.
+OLD_PORT="$(head -c 64 "$PREFIX/port" 2>/dev/null || true)"
 if [[ "$OS" == "Linux" ]]; then
   SERVICE_ACTIVE=1; systemctl is-active --quiet agy-region-fixer.service && SERVICE_ACTIVE=0
-  if port_busy && ! port_is_ours "$SERVICE_ACTIVE"; then
-    err "port $PORT is busy with a service that is not ours; pick another: AGY_BYPASS_PORT=8081 sudo bash $0"
-  fi
+  PORT="$(select_proxy_port)" || err "could not select the proxy port"
+  say "Proxy address: 127.0.0.1:$PORT"
   cat > /etc/systemd/system/agy-region-fixer.service <<UNIT
 [Unit]
 Description=Antigravity region fixer (MITM, cleans ineligibleTiers)
@@ -300,9 +398,8 @@ UNIT
 else  # macOS: LaunchAgent for the current user
   # exact label match: "com.agy.region-fixer" is not a prefix of the heal agent
   SERVICE_ACTIVE=1; launchctl list 2>/dev/null | awk '$3 == "com.agy.region-fixer" { found = 1 } END { exit !found }' && SERVICE_ACTIVE=0
-  if port_busy && ! port_is_ours "$SERVICE_ACTIVE"; then
-    err "port $PORT is busy with a service that is not ours; pick another: AGY_BYPASS_PORT=8081 bash $0"
-  fi
+  PORT="$(select_proxy_port)" || err "could not select the proxy port"
+  say "Proxy address: 127.0.0.1:$PORT"
   PLIST="$HOME/Library/LaunchAgents/com.agy.region-fixer.plist"
   mkdir -p "$HOME/Library/LaunchAgents"
   X_VENV="$(xml_esc "$VENV")"; X_PREFIX="$(xml_esc "$PREFIX")"; X_CA_DIR="$(xml_esc "$CA_DIR")"
@@ -535,8 +632,9 @@ shim_entry() {
   fi
   [[ -e "$target" || -e "$target.real" ]] || return 0
   if is_our_shim "$target"; then
-    if [[ "$force" -eq 1 ]]; then
-      # reinstall: port/CA may have changed
+    if [[ "$force" -eq 1 ]] || ! cmp -s "$target" <(render_shim "$target.real"); then
+      # Refresh registered shims when the proxy port/CA changes, including entries
+      # other than the one found first in PATH. Identical shims stay untouched.
       write_shim "$target.real" "$target" || { echo "[heal] FAILED to update shim for $target"; return 1; }
       echo "[heal] shim updated: $target"
     fi
@@ -739,9 +837,8 @@ OWNER_HOME="$HOME"
 # the owner's PATH as an interactive login shell sees it (rc files may print noise: take a marked line)
 OWNER_PATH=""
 if [[ -n "$OWNER_NAME" ]]; then
-  OWNER_PATH="$(run_with_timeout 15 "${OWNER_CMD[@]}" env -i HOME="$OWNER_HOME" USER="$OWNER_NAME" TERM=dumb \
-    bash -lic 'printf "\n@@AGYPATH@@%s@@\n" "$PATH"' </dev/null 2>/dev/null \
-    | sed -n 's/^@@AGYPATH@@\(.*\)@@$/\1/p' | tail -n 1 || true)"
+  capture_owner_path "${OWNER_CMD[@]}" env -i HOME="$OWNER_HOME" USER="$OWNER_NAME" TERM=dumb \
+    bash -lic 'printf "\n@@AGYPATH@@%s@@\n" "$PATH"'
 fi
 OWNER_PATH="${OWNER_PATH:+$OWNER_PATH:}$PATH"
 
@@ -875,6 +972,7 @@ fi
 
 # ---------------------------------------------------------------------------
 say "5/6 Shim self-healing after CLI updates (instant + every 5 minutes)"
+"$PREFIX/heal.sh"   # propagate the selected port to every registered owned shim
 # what the path units/WatchPaths should watch: the path from shim.path and its resolved target (no duplicates)
 watch_targets() {
   local p r w

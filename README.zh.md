@@ -101,11 +101,11 @@ flowchart LR
     S -- "代理正常" --> E["🔐 SSL_CERT_FILE + HTTPS_PROXY"]
     S -- "代理无响应" --> R
     E --> R["📦 agy.real"]
-    R --> P["🛰️ mitmproxy 127.0.0.1:8080<br/>+ addon.py"]
+    R --> P["🛰️ mitmproxy 127.0.0.1:PORT<br/>+ addon.py"]
     P -- "ineligibleTiers → []" --> G[("☁️ *.googleapis.com")]
 ```
 
-- `agy` → shim → 若代理正常，则设置 `SSL_CERT_FILE`（本地 CA）和 `HTTPS_PROXY=127.0.0.1:8080` → 真正的二进制 `agy.real`
+- `agy` → shim → 若代理正常，则设置 `SSL_CERT_FILE`（本地 CA）和 `HTTPS_PROXY=127.0.0.1:PORT` → 真正的二进制 `agy.real`
 - 若代理未运行，shim 会直接调用 `agy`：你会看到原来的资格错误，但不会损坏任何东西
 - 默认日志只记录清理事件（`CLEANED …`）
 
@@ -152,10 +152,12 @@ flowchart LR
 
 | 变量 | 默认值 | 用途 | 系统 |
 |---|---|---|---|
-| `AGY_BYPASS_PORT` | `8080` | 代理端口 | 🐧 🍎 🪟 |
+| `AGY_BYPASS_PORT` | 自动选择 | 代理端口 | 🐧 🍎 🪟 |
 | `AGY_BYPASS_PREFIX` | `/opt/agy-region-fixer` · `~/.agy-region-fixer` | 安装目录 | 🐧 🍎 |
 | `AGY_BYPASS_BIN` | 在 `PATH` 中查找 `agy` | CLI 二进制路径 | 🐧 🍎 |
 | `AGY_ADDON_URL` | raw.githubusercontent.com | 管道安装时下载 `addon.py` 的地址 | 🐧 🍎 🪟 |
+
+默认从 `49152–65535` 中随机选择空闲的 localhost 端口，并保存到 `<安装目录>/port`。重新安装会尽量复用该高位端口；若不可用则重新选择。`AGY_BYPASS_PORT` 显式指定端口，占用时安装会报错。安装脚本会显示实际地址，并同步更新代理和所有包装脚本。Ctrl+C 会中断安装脚本及其临时命令；已启动的后台代理会持续运行，直到执行卸载脚本。
 
 ```bash
 AGY_BYPASS_PORT=8081 bash install.sh          # Linux 需要 sudo

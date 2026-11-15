@@ -20,7 +20,7 @@
 # ============================================================================
 $ErrorActionPreference = "Stop"
 $PREFIX  = Join-Path $env:USERPROFILE ".agy-region-fixer"
-$PORT    = if ($env:AGY_BYPASS_PORT) { $env:AGY_BYPASS_PORT } else { "8080" }
+$PORT    = $null
 $CA_DIR  = Join-Path $PREFIX "ca"
 $PIN     = "mitmproxy==12.3.1"
 $RUNKEY  = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
@@ -49,6 +49,51 @@ function Get-OemEncoding {
 # contents of a Python string literal (double-quoted): \ and " are escaped,
 # otherwise "C:\Users\..." gives a SyntaxError (\U starts a unicode escape)
 function ConvertTo-PyLiteral($text) { return $text.Replace('\', '\\').Replace('"', '\"') }
+
+# Only ASCII decimal digits are accepted; normalize zeros before converting so
+# even an overlong value cannot overflow or become part of generated commands.
+function ConvertTo-ProxyPort([string]$value) {
+  if ($value -cnotmatch '\A[0-9]+\z') { throw "AGY_BYPASS_PORT must be an ASCII decimal integer from 1 to 65535" }
+  $normalized = $value.TrimStart('0')
+  if (-not $normalized -or $normalized.Length -gt 5) { throw "AGY_BYPASS_PORT must be an ASCII decimal integer from 1 to 65535" }
+  $number = [int]$normalized
+  if ($number -gt 65535) { throw "AGY_BYPASS_PORT must be an ASCII decimal integer from 1 to 65535" }
+  return $number
+}
+function Test-PortBindable($port) {
+  $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $port)
+  try {
+    $listener.Server.ExclusiveAddressUse = $true
+    $listener.Start()
+    return $true
+  } catch [Net.Sockets.SocketException] { return $false }
+  finally { $listener.Stop() }
+}
+function Select-ProxyPort($requestedPort, $savedPortPath) {
+  if ($null -ne $requestedPort) {
+    if (-not (Test-PortBindable $requestedPort)) {
+      throw "port $requestedPort cannot be bound on 127.0.0.1; choose another AGY_BYPASS_PORT or leave it unset for automatic selection"
+    }
+    return $requestedPort
+  }
+  if (Test-Path -LiteralPath $savedPortPath) {
+    $savedText = Get-Content -LiteralPath $savedPortPath -Encoding UTF8 -First 1
+    try { $savedPort = ConvertTo-ProxyPort $savedText }
+    catch { $savedPort = $null }
+    if ($savedPort -ge 49152 -and (Test-PortBindable $savedPort)) { return $savedPort }
+  }
+  $maxAttempts = 32
+  for ($attempt = 0; $attempt -lt $maxAttempts; $attempt++) {
+    $candidate = Get-Random -Minimum 49152 -Maximum 65536
+    if (Test-PortBindable $candidate) { return $candidate }
+  }
+  throw "could not find a bindable localhost TCP port from 49152 to 65535 after $maxAttempts attempts; set AGY_BYPASS_PORT explicitly"
+}
+# Reject invalid configuration before any proxy process can be stopped.
+if (-not [string]::IsNullOrEmpty($env:AGY_BYPASS_PORT)) {
+  try { $PORT = ConvertTo-ProxyPort $env:AGY_BYPASS_PORT }
+  catch { Die $_.Exception.Message }
+}
 
 # --- python ----------------------------------------------------------------
 # We deliberately do not use "py -3": the launcher sometimes passes -3 to python.exe
@@ -97,10 +142,12 @@ function Test-MitmWorks {
 }
 # OUR proxy copies only (re-install); a running mitmdump.exe locks the venv files
 function Stop-OurProxy {
-  Get-CimInstance Win32_Process -Filter "Name='mitmdump.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -like "*$PREFIX*" } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-  Start-Sleep 1
+  Get-CimInstance Win32_Process -Filter "Name='mitmdump.exe'" -OperationTimeoutSec 5 -ErrorAction SilentlyContinue |
+    Where-Object { $_.ExecutablePath -eq $venvMitm } |
+    ForEach-Object {
+      Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+      Wait-Process -Id $_.ProcessId -Timeout 5 -ErrorAction SilentlyContinue
+    }
 }
 # a failed rebuild puts the previous venv back: an outdated but working one must survive
 function Stop-VenvSetup($message) {
@@ -150,6 +197,13 @@ $addonText = $addonText.Replace("@@LOG@@", (ConvertTo-PyLiteral (Join-Path $PREF
 if ($addonText -match "@@(LOG|VERBOSE_FLAG)@@") { Die "unsubstituted placeholders left in addon.py" }
 WriteNoBom (Join-Path $PREFIX "addon.py") $addonText
 
+# Stop our previous proxy before checking whether its saved port can be reused.
+Stop-OurProxy
+try { $PORT = Select-ProxyPort $PORT (Join-Path $PREFIX "port") }
+catch { Die $_.Exception.Message }
+WriteNoBom (Join-Path $PREFIX "port") ("$PORT`r`n")
+Say "Proxy port: 127.0.0.1:$PORT"
+
 # --- proxy runner ----------------------------------------------------------
 $runPs1 = @"
 & "$(Join-Path $PREFIX 'venv\Scripts\mitmdump.exe')" -s "$(Join-Path $PREFIX 'addon.py')" -p $PORT --set listen_host=127.0.0.1 --set "confdir=$CA_DIR" *>> "$(Join-Path $PREFIX 'mitm-stdout.log')"
@@ -158,23 +212,6 @@ WriteBom (Join-Path $PREFIX "run-proxy.ps1") $runPs1
 
 # --- autostart: HKCU Run (no admin) + immediate start ----------------------
 Say "3/6 Proxy autostart (HKCU Run, port 127.0.0.1:$PORT)"
-# stop OUR old proxy copies (re-install) — leave others alone
-Stop-OurProxy
-
-# is the port taken by something other than us? (after killing our copies it must be free)
-# a real TCP probe instead of curl exit codes
-function Test-PortBusy($p) {
-  $c = New-Object System.Net.Sockets.TcpClient
-  try {
-    $iar = $c.BeginConnect("127.0.0.1", $p, $null, $null)
-    if ($iar.AsyncWaitHandle.WaitOne(1500) -and $c.Connected) { return $true }
-    return $false
-  } catch { return $false } finally { $c.Close() }
-}
-if (Test-PortBusy $PORT) {
-  Die "port $PORT is in use by something else; run with another port: `$env:AGY_BYPASS_PORT='8081'; powershell -File install.ps1"
-}
-
 $runCmd = "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PREFIX\run-proxy.ps1`""
 New-Item -Path $RUNKEY -Force | Out-Null   # the Run key may be missing on stripped-down profiles
 Set-ItemProperty -Path $RUNKEY -Name "agy-region-fixer" -Value $runCmd
@@ -337,9 +374,13 @@ $ErrorActionPreference = "Continue"
 $PREFIX = '@PREFIX@'
 Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "agy-region-fixer" -ErrorAction SilentlyContinue
 schtasks /Delete /F /TN "agy-region-fixer-heal" 2>$null
-Get-CimInstance Win32_Process -Filter "Name='mitmdump.exe'" -ErrorAction SilentlyContinue |
-  Where-Object { $_.CommandLine -like "*$PREFIX*" } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+$venvMitm = Join-Path $PREFIX "venv\Scripts\mitmdump.exe"
+Get-CimInstance Win32_Process -Filter "Name='mitmdump.exe'" -OperationTimeoutSec 5 -ErrorAction SilentlyContinue |
+  Where-Object { $_.ExecutablePath -eq $venvMitm } |
+  ForEach-Object {
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    Wait-Process -Id $_.ProcessId -Timeout 5 -ErrorAction SilentlyContinue
+  }
 $shimPathFile = Join-Path $PREFIX "shim.path"
 if (Test-Path -LiteralPath $shimPathFile) {
   $shimPath = (Get-Content -LiteralPath $shimPathFile -Encoding UTF8 -First 1).Trim()
@@ -372,6 +413,7 @@ if ($smokeCmd) {
   Say "Smoke test: agy -p (up to 120 s)"
   $smokeOut = [IO.Path]::GetTempFileName()
   $smokeErr = [IO.Path]::GetTempFileName()
+  $proc = $null
   try {
     $proc = Start-Process -FilePath $smokeCmd.Source -ArgumentList @("-p", "`"Reply exactly: BYPASS_OK`"") `
       -NoNewWindow -PassThru -RedirectStandardOutput $smokeOut -RedirectStandardError $smokeErr
@@ -389,7 +431,13 @@ if ($smokeCmd) {
       Say "smoke did not finish in 120 s — aborted (did you log in? log: $PREFIX\mitm.log)"
     }
   } catch { Say "smoke failed: $_" }
-  finally { Remove-Item -LiteralPath $smokeOut, $smokeErr -Force -ErrorAction SilentlyContinue }
+  finally {
+    try {
+      # Ctrl+C also runs finally: stop only the process tree started by this smoke.
+      if ($proc -and -not $proc.HasExited) { taskkill /T /F /PID $proc.Id 2>&1 | Out-Null }
+    } catch { Say "could not stop smoke process $($proc.Id): $_" }
+    finally { Remove-Item -LiteralPath $smokeOut, $smokeErr -Force -ErrorAction SilentlyContinue }
+  }
 }
 
 Say "Done. Proxy: 127.0.0.1:$PORT | log: $PREFIX\mitm.log | uninstall: powershell $PREFIX\uninstall.ps1"

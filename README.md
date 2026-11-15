@@ -101,11 +101,11 @@ flowchart LR
     S -- "proxy alive" --> E["🔐 SSL_CERT_FILE + HTTPS_PROXY"]
     S -- "proxy not answering" --> R
     E --> R["📦 agy.real"]
-    R --> P["🛰️ mitmproxy 127.0.0.1:8080<br/>+ addon.py"]
+    R --> P["🛰️ mitmproxy 127.0.0.1:PORT<br/>+ addon.py"]
     P -- "ineligibleTiers → []" --> G[("☁️ *.googleapis.com")]
 ```
 
-- `agy` → shim → if the proxy is alive, sets `SSL_CERT_FILE` (local CA) and `HTTPS_PROXY=127.0.0.1:8080` → the real binary `agy.real`
+- `agy` → shim → if the proxy is alive, sets `SSL_CERT_FILE` (local CA) and `HTTPS_PROXY=127.0.0.1:PORT` → the real binary `agy.real`
 - if the proxy is down the shim just calls `agy` without it: you get the old eligibility error, but nothing breaks
 - by default the log holds only cleaning facts (`CLEANED …`)
 
@@ -152,10 +152,12 @@ On Linux heal is started by root (systemd) while the directory holding `agy` usu
 
 | Variable | Default | Purpose | OS |
 |---|---|---|---|
-| `AGY_BYPASS_PORT` | `8080` | proxy port | 🐧 🍎 🪟 |
+| `AGY_BYPASS_PORT` | automatic | proxy port | 🐧 🍎 🪟 |
 | `AGY_BYPASS_PREFIX` | `/opt/agy-region-fixer` · `~/.agy-region-fixer` | install directory | 🐧 🍎 |
 | `AGY_BYPASS_BIN` | `agy` found in `PATH` | path to the CLI binary | 🐧 🍎 |
 | `AGY_ADDON_URL` | raw.githubusercontent.com | where to fetch `addon.py` for a piped install | 🐧 🍎 🪟 |
+
+The default is a randomly selected free localhost port in `49152–65535`, saved in `<install directory>/port`. A reinstall reuses that high port when available; otherwise it selects another. `AGY_BYPASS_PORT` explicitly fixes the port and fails if it is occupied. The installer prints the actual address and updates the proxy and all wrappers together. Ctrl+C stops the installer and its temporary commands; an already started background proxy remains until you run uninstall.
 
 ```bash
 AGY_BYPASS_PORT=8081 bash install.sh          # Linux: with sudo

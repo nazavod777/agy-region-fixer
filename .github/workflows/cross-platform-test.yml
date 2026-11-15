@@ -88,6 +88,8 @@ jobs:
         run: |
           & "$env:USERPROFILE\.agy-region-fixer\venv\Scripts\python.exe" -m unittest discover -s tests -p 'test_*.py' -v
           if ($LASTEXITCODE -ne 0) { throw "Addon regression tests failed" }
+          & powershell -NoProfile -NonInteractive -File tests/test_windows_config.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Windows port selection tests failed" }
 
       - name: Verify proxy is listening and CA exists (unix)
         if: runner.os != 'Windows'
