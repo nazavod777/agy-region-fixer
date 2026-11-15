@@ -1105,12 +1105,12 @@ internal static class Launcher
             string targetLiteral = Convert.ToBase64String(Encoding.Unicode.GetBytes(configuration.Target));
             string json = new JavaScriptSerializer().Serialize(arguments);
             string argumentsLiteral = Convert.ToBase64String(Encoding.Unicode.GetBytes(json));
-            string script = "$target=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('" +
+            string script = "$ProgressPreference='SilentlyContinue';$target=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('" +
                 targetLiteral + "'));$arguments=@(ConvertFrom-Json -InputObject " +
                 "([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('" + argumentsLiteral +
                 "'))));& $target @arguments;$succeeded=$?;" +
                 "if($null -ne $LASTEXITCODE){exit $LASTEXITCODE};if($succeeded){exit 0}else{exit 1}";
-            start.Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " +
+            start.Arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -InputFormat Text -OutputFormat Text -EncodedCommand " +
                 Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
         }
 
