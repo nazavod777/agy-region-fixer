@@ -199,8 +199,12 @@ foreach ($name in @("USERPROFILE", "PATH", "HTTPS_PROXY", "SSL_CERT_FILE", "NODE
 }
 $script:scratch = Join-Path ([IO.Path]::GetTempPath()) ("agy-windows-launcher-tests-" + [guid]::NewGuid().ToString("N"))
 $listener = $null
+$savedInputEncoding = [Console]::InputEncoding
 New-Item -ItemType Directory -Path $scratch | Out-Null
 try {
+  # .NET Framework uses Console.InputEncoding for the redirected stdin writer.
+  # Avoid adding an encoding preamble to the fixture's input bytes.
+  [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
   $script:profile = Join-Path $scratch "profile Unicode Ж ! & (test)"
   $script:workingDirectory = Join-Path $profile "working directory"
   $script:injectionSentinel = Join-Path $workingDirectory "agy-injected-sentinel.txt"
@@ -527,6 +531,7 @@ exit ([int]$env:AGY_TEST_EXIT)
   }
   Write-Host "Windows native launcher integration tests passed"
 } finally {
+  [Console]::InputEncoding = $savedInputEncoding
   if ($null -ne $listener) { $listener.Stop() }
   foreach ($name in $savedEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], "Process") }
   if ([IO.Directory]::Exists($scratch)) { [IO.Directory]::Delete($scratch, $true) }
