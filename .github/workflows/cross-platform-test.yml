@@ -11,7 +11,13 @@ on:
   push:
     branches: [master]
     paths: [install.sh, install.ps1, addon.py, 'tests/**', .github/workflows/cross-platform-test.yml]
-  workflow_dispatch:   # full 3-OS run on demand
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to verify (all runs the complete matrix)
+        type: choice
+        default: all
+        options: [all, ubuntu-latest, windows-latest, macos-latest]
 
 jobs:
   install-test:
@@ -19,7 +25,7 @@ jobs:
       fail-fast: false
       matrix:
         # push → ubuntu only; dispatch → all three OSes
-        os: ${{ github.event_name == 'workflow_dispatch' && fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
+        os: ${{ github.event_name == 'workflow_dispatch' && fromJSON(inputs.platform == 'all' && '["ubuntu-latest", "windows-latest", "macos-latest"]' || format('["{0}"]', inputs.platform)) || fromJSON('["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -69,6 +75,13 @@ jobs:
         env:
           AGY_BYPASS_PORT: "8090"
 
+      - name: Verify native Windows launcher lifecycle
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & powershell -NoProfile -NonInteractive -File tests/test_windows_launchers.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Windows native launcher tests failed" }
+
       - name: Run installer (windows)
         if: runner.os == 'Windows'
         shell: powershell   # Windows PowerShell 5.1, as in the README
@@ -90,8 +103,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Addon regression tests failed" }
           & powershell -NoProfile -NonInteractive -File tests/test_windows_config.ps1
           if ($LASTEXITCODE -ne 0) { throw "Windows port selection tests failed" }
-          & powershell -NoProfile -NonInteractive -File tests/test_windows_launchers.ps1
-          if ($LASTEXITCODE -ne 0) { throw "Windows native launcher tests failed" }
 
       - name: Verify proxy is listening and CA exists (unix)
         if: runner.os != 'Windows'

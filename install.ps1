@@ -546,27 +546,40 @@ function Get-AgyNativeTemplate {
   }
   if (-not $compiler) { throw 'The Windows .NET Framework C# compiler was not found.' }
   $stage = Get-AgyUniquePath $template
-  $stdout = Get-AgyUniquePath (Join-Path $Prefix 'csc.stdout')
-  $stderr = Get-AgyUniquePath (Join-Path $Prefix 'csc.stderr')
   $Transaction.Temps.Add($stage)
-  $Transaction.Temps.Add($stdout)
-  $Transaction.Temps.Add($stderr)
   $arguments = '/nologo /target:exe /optimize+ /platform:anycpu /reference:System.Web.Extensions.dll /out:"' + $stage + '" "' + $SourcePath + '"'
-  $process = $null
+  $startInfo = New-Object Diagnostics.ProcessStartInfo
+  $startInfo.FileName = $compiler
+  $startInfo.Arguments = $arguments
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+  $process = New-Object Diagnostics.Process
+  $process.StartInfo = $startInfo
+  $processStarted = $false
   try {
-    $process = Start-Process -FilePath $compiler -ArgumentList $arguments -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    $processStarted = $process.Start()
+    if (-not $processStarted) { throw 'The native launcher compiler did not start.' }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
     if (-not $process.WaitForExit(30000)) {
       $process.Kill()
       [void]$process.WaitForExit(5000)
       throw 'Native launcher compilation timed out after 30 seconds.'
     }
-    if ($process.ExitCode -ne 0) {
-      $message = [IO.File]::ReadAllText($stdout) + [IO.File]::ReadAllText($stderr)
-      throw "Native launcher compilation failed (exit $($process.ExitCode)): $message"
+    $exitCode = $process.ExitCode
+    if ($null -eq $exitCode) { throw 'The native launcher compiler exit code is unavailable.' }
+    if (-not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdoutTask, $stderrTask), 5000)) {
+      throw 'Timed out while collecting the native launcher compiler output.'
+    }
+    if ($exitCode -ne 0) {
+      $message = $stdoutTask.Result + $stderrTask.Result
+      throw "Native launcher compilation failed (exit ${exitCode}): $message"
     }
   } finally {
     if ($process) {
-      try { if (-not $process.HasExited) { $process.Kill(); [void]$process.WaitForExit(5000) } }
+      try { if ($processStarted -and -not $process.HasExited) { $process.Kill(); [void]$process.WaitForExit(5000) } }
       finally { $process.Dispose() }
     }
   }
@@ -630,15 +643,34 @@ function Install-AgyWindowsShim {
     param($root)
     $savedState = Read-AgyShimState $root
     $state = $savedState
+    $previousOverlay = $null
+    if ($savedState -and $savedState.mode -eq 'overlay' -and -not [IO.File]::Exists($savedState.target)) {
+      [void](Assert-AgyOwnedConfig $savedState)
+      if ([IO.File]::Exists($savedState.shimPath) -and -not (Test-AgyNativeShim $savedState.shimPath)) {
+        throw "Refusing to replace a foreign overlay executable: $($savedState.shimPath)"
+      }
+      $previousOverlay = $savedState
+      $state = Get-AgyCommandTarget $root
+      if ($state.mode -eq 'overlay') {
+        # The same private wrapper keeps ownership of its existing PATH entries.
+        $state.pathAdded = $previousOverlay.pathAdded
+        $state | Add-Member -NotePropertyName processPathAdded -NotePropertyValue $previousOverlay.processPathAdded
+      }
+    }
     $legacy = $null
     if (-not $state) { $legacy = Read-AgyLegacyState $root; $state = $legacy }
     $legacyPath = if ($state -and $state.PSObject.Properties['legacyPath']) { $state.legacyPath } else { $null }
     if ($legacyPath -and -not (Test-AgyLegacyShim $legacyPath)) { throw "The legacy shim is no longer owned: $legacyPath" }
     if (-not $state) { $state = Get-AgyCommandTarget $root }
     $configPath = Join-Path (Split-Path -Parent $state.shimPath) 'agy-launcher.json'
-    if ($savedState) { [void](Assert-AgyOwnedConfig $state) }
+    $reuseOverlay = $previousOverlay -and (Test-AgySamePath $state.shimPath $previousOverlay.shimPath)
+    if ($previousOverlay) {
+      if (-not $reuseOverlay -and [IO.File]::Exists($configPath)) {
+        throw "Refusing to replace a foreign launcher configuration: $configPath"
+      }
+    } elseif ($savedState) { [void](Assert-AgyOwnedConfig $state) }
     elseif ([IO.File]::Exists($configPath)) { throw "Refusing to replace a foreign launcher configuration: $configPath" }
-    if (-not $savedState -and -not $legacy -and $state.mode -eq 'inplace' -and [IO.File]::Exists($state.target)) {
+    if ((-not $savedState -or $previousOverlay) -and -not $legacy -and $state.mode -eq 'inplace' -and [IO.File]::Exists($state.target)) {
       throw "Refusing to replace an existing original-binary backup: $($state.target)"
     }
     if ($state.mode -eq 'overlay') {
@@ -659,7 +691,7 @@ function Install-AgyWindowsShim {
       $replaceOriginal = $false
       if ($state.mode -eq 'inplace') {
         if ([IO.File]::Exists($state.shimPath) -and -not (Test-AgyNativeShim $state.shimPath)) {
-          if (($savedState -or $legacy) -and -not (Test-AgyStableUpdate $state.shimPath)) {
+          if ((($savedState -and -not $previousOverlay) -or $legacy) -and -not (Test-AgyStableUpdate $state.shimPath)) {
             throw "The replacement agy.exe is incomplete or suspicious; it was left untouched: $($state.shimPath)"
           }
           $replaceOriginal = $true
@@ -680,6 +712,24 @@ function Install-AgyWindowsShim {
       if ($state.mode -eq 'overlay') { $pathChanged = $true; Add-AgyOverlayPath $state }
       $config = [ordered]@{ version = 1; target = $state.target; kind = $state.kind; port = $Port; certificate = $Certificate }
       Set-AgyNativeFiles $transaction $state $nativeTemplate $config -ReplaceOriginal:$replaceOriginal
+      if ($previousOverlay -and -not $reuseOverlay) {
+        # Retire the old wrapper only after the new CLI and its config are ready.
+        $previousConfig = Assert-AgyOwnedConfig $previousOverlay
+        if ([IO.File]::Exists($previousOverlay.shimPath)) {
+          if (-not (Test-AgyNativeShim $previousOverlay.shimPath)) {
+            throw "The previous overlay executable is no longer owned: $($previousOverlay.shimPath)"
+          }
+          Remove-AgyTransactionFile $transaction $previousOverlay.shimPath
+        }
+        Remove-AgyTransactionFile $transaction $previousConfig
+        $pathChanged = $true
+        if ($previousOverlay.pathAdded) {
+          Set-AgyUserPath -Value (Get-AgyPathWithoutEntry (Get-AgyUserPath) $previousOverlay.pathEntry)
+        }
+        if ($previousOverlay.pathAdded -or $previousOverlay.processPathAdded) {
+          $env:Path = Get-AgyPathWithoutEntry $env:Path $previousOverlay.pathEntry
+        }
+      }
       if ($legacyPath) {
         Remove-AgyTransactionFile $transaction $legacyPath
         Remove-AgyTransactionFile $transaction (Join-Path $root 'shim.path')
@@ -1035,15 +1085,18 @@ internal static class Launcher
         else if (configuration.Kind == "cmd")
         {
             start.FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe");
-            string prefix = "AGY_" + Guid.NewGuid().ToString("N") + "_";
-            string quotedArguments = QuoteArguments(arguments);
-            if ((long)configuration.Target.Length + quotedArguments.Length + 3 > CmdCommandLineLimit)
+            StringBuilder command = new StringBuilder();
+            command.Append('"');
+            command.Append(EscapeCmd(configuration.Target));
+            foreach (string argument in arguments)
+            {
+                command.Append(' ');
+                command.Append(EscapeCmd(EscapeCmd(QuoteArgument(argument))));
+            }
+            command.Append('"');
+            if (command.Length > CmdCommandLineLimit)
                 throw new LauncherException("arguments exceed the cmd.exe command-line limit", CannotExecute);
-            start.EnvironmentVariables[prefix + "TARGET"] = configuration.Target;
-            start.EnvironmentVariables[prefix + "ARGUMENTS"] = quotedArguments;
-            // Delayed expansion injects values after cmd's operators and percent
-            // expressions have been parsed. Never insert user text into this code.
-            start.Arguments = "/d /v:on /s /c \"\"!" + prefix + "TARGET!\" !" + prefix + "ARGUMENTS!\"";
+            start.Arguments = "/d /v:off /s /c " + command.ToString();
         }
         else
         {
@@ -1099,6 +1152,22 @@ internal static class Launcher
         }
         result.Append('\\', backslashes * 2);
         result.Append('"');
+        return result.ToString();
+    }
+
+    private static string EscapeCmd(string value)
+    {
+        // cmd shims parse forwarded arguments twice, so callers escape arguments
+        // twice after CRT quoting, and escape the command path once.
+        // https://github.com/moxystudio/node-cross-spawn/blob/master/lib/util/escape.js
+        const string metacharacters = "()[]%!^\"`<>&|;, *?";
+        StringBuilder result = new StringBuilder();
+        foreach (char character in value)
+        {
+            if (metacharacters.IndexOf(character) >= 0)
+                result.Append('^');
+            result.Append(character);
+        }
         return result.ToString();
     }
 

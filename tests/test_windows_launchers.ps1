@@ -12,6 +12,11 @@ function Assert-True($condition, [string]$message) {
 function Assert-Equal($actual, $expected, [string]$message) {
   if ($actual -cne $expected) { throw "$message; expected '$expected', got '$actual'" }
 }
+function Assert-Throws([scriptblock]$action, [string]$expectedMessage) {
+  $failure = $null
+  try { & $action | Out-Null } catch { $failure = $_.Exception.Message }
+  Assert-True ($failure -and $failure.Contains($expectedMessage)) "Expected error containing '$expectedMessage'; got '$failure'"
+}
 function Assert-Arguments($actual, [string[]]$expected, [string]$message) {
   $received = @($actual)
   Assert-Equal $received.Count $expected.Count "$message (argument count)"
@@ -181,6 +186,12 @@ function Copy-PaddedFixture([string]$destination, [long]$length = 12MB) {
   $stream = [IO.File]::OpenWrite($destination)
   try { $stream.SetLength($length) } finally { $stream.Dispose() }
 }
+function Write-CmdFixture([string]$directory) {
+  $target = Join-Path $directory "agy.cmd"
+  [IO.File]::Copy($script:fixturePath, (Join-Path $directory "fixture.exe"), $true)
+  Write-Utf8 $target "@ECHO off`r`nSETLOCAL`r`nSET `"AGY_TEST_LAUNCHER_NAME=%~n0`"`r`n`"%~dp0fixture.exe`" %*`r`nexit /b %errorlevel%`r`n"
+  return $target
+}
 
 $savedEnvironment = @{}
 foreach ($name in @("USERPROFILE", "PATH", "HTTPS_PROXY", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS")) {
@@ -296,6 +307,34 @@ class LauncherFixture {
   $listener.Stop()
   $listener = $null
 
+  # Fail after replacing an existing config: every previously committed file must
+  # be restored, including the real CLI and the recovery metadata.
+  $rollbackConfig = Join-Path $plain.Bin "agy-launcher.json"
+  $rollbackFiles = @($state.shimPath, $state.target, $rollbackConfig, (Join-Path $plain.Prefix "shim-state.json"), (Join-Path $plain.Prefix "agy.exe.tpl"))
+  $rollbackDigests = @{}
+  foreach ($path in $rollbackFiles) { $rollbackDigests[$path] = Get-Digest $path }
+  $transactionWriter = (Get-Command Set-AgyTransactionFile).ScriptBlock
+  $script:configWriteFaultTriggered = $false
+  & {
+    function Set-AgyTransactionFile {
+      param($Transaction, [string]$Path, [string]$Stage)
+      $replacingConfig = $Path -ieq $rollbackConfig -and [IO.File]::Exists($Path)
+      & $transactionWriter -Transaction $Transaction -Path $Path -Stage $Stage
+      if ($replacingConfig) {
+        $script:configWriteFaultTriggered = $true
+        throw "synthetic failure after existing config replacement"
+      }
+    }
+    Assert-Throws {
+      Install-AgyWindowsShim -Prefix $plain.Prefix -Port $port -Certificate $certificate -SourcePath $launcherSourcePath
+    } "synthetic failure after existing config replacement"
+  }
+  Assert-True $script:configWriteFaultTriggered "Configuration rollback injection did not execute"
+  foreach ($path in $rollbackFiles) {
+    Assert-Equal (Get-Digest $path) $rollbackDigests[$path] "Failed reinstallation did not restore $path"
+  }
+  Assert-Configuration (Read-State $plain.Prefix) $changedPort "exe"
+
   # A padded valid PE update is promoted; small junk must never replace the backup.
   Copy-PaddedFixture $plainExe 13MB
   $updateDigest = Get-Digest $plainExe
@@ -325,6 +364,73 @@ class LauncherFixture {
   Remove-AgyWindowsShim -Prefix $legacy.Prefix | Out-Null
   Assert-True ([IO.File]::Exists((Join-Path $legacy.Bin "agy.exe"))) "Legacy uninstall did not restore agy.exe"
 
+  # A persistent PATH failure during both installation and rollback must not
+  # prevent file rollback or restoration of the current process's PATH.
+  $pathFailure = New-Scenario "user-path-failure"
+  $pathFailureTarget = Write-CmdFixture $pathFailure.Bin
+  $pathFailureDigest = Get-Digest $pathFailureTarget
+  $pathBeforeFailure = $env:PATH
+  $userPathBeforeFailure = $script:mockUserPath
+  $script:userPathFailureAttempts = 0
+  & {
+    function Set-AgyUserPath([string]$Value) {
+      $script:userPathFailureAttempts++
+      throw "synthetic persistent User PATH failure"
+    }
+    Assert-Throws {
+      Install-AgyWindowsShim -Prefix $pathFailure.Prefix -Port $port -Certificate $certificate -SourcePath $launcherSourcePath
+    } "synthetic persistent User PATH failure"
+  }
+  Assert-Equal $script:userPathFailureAttempts 2 "User PATH failure did not exercise registry rollback"
+  Assert-Equal $env:PATH $pathBeforeFailure "Registry rollback failure prevented process PATH restoration"
+  Assert-Equal $script:mockUserPath $userPathBeforeFailure "Registry failure changed persistent User PATH"
+  Assert-Equal (Get-Digest $pathFailureTarget) $pathFailureDigest "Registry failure changed the original CMD"
+  foreach ($relative in @("bin\agy.exe", "bin\agy-launcher.json", "shim-state.json", "agy.exe.tpl")) {
+    Assert-True (-not [IO.File]::Exists((Join-Path $pathFailure.Prefix $relative))) "Registry failure left an installation file: $relative"
+  }
+
+  foreach ($replacementKind in @("exe", "cmd")) {
+    # A saved overlay must not keep masking another CLI after its target vanishes.
+    $migration = New-Scenario ("missing-target-to-" + $replacementKind)
+    $oldTarget = Write-CmdFixture $migration.Bin
+    $userPathBeforeMigration = $script:mockUserPath
+    $oldState = Install-Scenario $migration $port
+    $oldOverlayDirectory = Split-Path $oldState.shimPath -Parent
+    [IO.File]::Delete($oldTarget)
+    $replacementDirectory = Join-Path $migration.Directory "replacement-cli"
+    New-Item -ItemType Directory -Path $replacementDirectory | Out-Null
+    if ($replacementKind -eq "exe") {
+      $replacementTarget = Join-Path $replacementDirectory "agy.exe"
+      Copy-PaddedFixture $replacementTarget
+    } else { $replacementTarget = Write-CmdFixture $replacementDirectory }
+    $replacementDigest = Get-Digest $replacementTarget
+    $foreignAfter = Join-Path $migration.Directory "foreign-after"
+    $script:mockUserPath += ";" + $foreignAfter
+    $env:PATH = $oldOverlayDirectory + ";" + $replacementDirectory + ";" + $systemPath + ";" + $foreignAfter
+    $state = Install-Scenario $migration $port
+    Assert-Equal $state.kind $replacementKind "Missing-target migration retained its previous launcher kind"
+    if ($replacementKind -eq "exe") {
+      Assert-Equal $state.mode "inplace" "Replacement plain EXE retained overlay mode"
+      Assert-Equal $state.shimPath $replacementTarget "Replacement plain EXE moved from its original path"
+      Assert-Equal $state.target (Join-Path $replacementDirectory "agy.real.exe") "Replacement plain EXE target is incorrect"
+      Assert-Equal (Get-Digest $state.target) $replacementDigest "Missing-target migration lost the replacement plain EXE"
+      Assert-True (-not [IO.File]::Exists($oldState.shimPath)) "Missing-target migration retained its previous overlay EXE"
+      Assert-True (-not [IO.File]::Exists((Join-Path $oldOverlayDirectory "agy-launcher.json"))) "Missing-target migration retained its previous overlay config"
+    } else {
+      Assert-Equal $state.mode "overlay" "Replacement CMD was relocated"
+      Assert-Equal $state.shimPath $oldState.shimPath "Replacement CMD created a competing overlay"
+      Assert-Equal $state.target $replacementTarget "Replacement CMD target is incorrect"
+      Assert-Equal (Get-Digest $replacementTarget) $replacementDigest "Missing-target migration changed the replacement CMD"
+    }
+    Assert-Configuration $state $port $replacementKind
+    Remove-AgyWindowsShim -Prefix $migration.Prefix | Out-Null
+    Assert-Equal (Get-Digest $replacementTarget) $replacementDigest "Uninstall changed the replacement CLI after missing-target migration"
+    Assert-Equal $script:mockUserPath ($userPathBeforeMigration + ";" + $foreignAfter) "Migration or uninstall discarded foreign User PATH changes"
+    Assert-True (@($env:PATH -split ';' | Where-Object { $_ -ieq $replacementDirectory }).Count -eq 1) "Migration or uninstall lost the replacement CLI directory"
+    Assert-True (@($env:PATH -split ';' | Where-Object { $_ -ieq $foreignAfter }).Count -eq 1) "Migration or uninstall lost a later process PATH change"
+    Assert-True (@($env:PATH -split ';' | Where-Object { $_ -ieq $oldOverlayDirectory }).Count -eq 0) "Migration or uninstall retained its previous process PATH entry"
+  }
+
   foreach ($kind in @("cmd", "ps1", "scoop", "windowsapps-path")) {
     $scenario = New-Scenario $kind
     if ($kind -eq "windowsapps-path") {
@@ -336,9 +442,7 @@ class LauncherFixture {
     $targetKind = "exe"
     if ($kind -eq "cmd") {
       $targetKind = "cmd"
-      $target = Join-Path $scenario.Bin "agy.cmd"
-      [IO.File]::Copy($fixturePath, (Join-Path $scenario.Bin "fixture.exe"), $true)
-      Write-Utf8 $target "@ECHO off`r`nSETLOCAL`r`nSET `"AGY_TEST_LAUNCHER_NAME=%~n0`"`r`n`"%~dp0fixture.exe`" %*`r`nexit /b %errorlevel%`r`n"
+      $target = Write-CmdFixture $scenario.Bin
     } elseif ($kind -eq "ps1") {
       $targetKind = "ps1"
       $target = Join-Path $scenario.Bin "agy.ps1"
@@ -394,6 +498,22 @@ exit ([int]$env:AGY_TEST_EXIT)
     Repair-AgyWindowsShim -Prefix $scenario.Prefix | Out-Null
     Assert-True (Test-AgyNativeShim -Path $state.shimPath) "Heal did not restore missing $kind overlay"
     Assert-Equal (Get-Digest $target) $targetDigest "Heal changed the $kind original launcher"
+    if ($kind -eq "cmd") {
+      $foreignOverlay = "foreign executable replacement"
+      Write-Utf8 $state.shimPath $foreignOverlay
+      $foreignStateDigest = Get-Digest (Join-Path $scenario.Prefix "shim-state.json")
+      $foreignConfigDigest = Get-Digest (Join-Path $overlayDirectory "agy-launcher.json")
+      $foreignUserPath = $script:mockUserPath
+      $foreignProcessPath = $env:PATH
+      Assert-Throws { Remove-AgyWindowsShim -Prefix $scenario.Prefix } "foreign executable"
+      Assert-True ([IO.Directory]::Exists($scenario.Prefix)) "Refused uninstall removed its installation directory"
+      Assert-Equal ([IO.File]::ReadAllText($state.shimPath)) $foreignOverlay "Refused uninstall changed a foreign overlay executable"
+      Assert-Equal (Get-Digest (Join-Path $scenario.Prefix "shim-state.json")) $foreignStateDigest "Refused uninstall changed recovery state"
+      Assert-Equal (Get-Digest (Join-Path $overlayDirectory "agy-launcher.json")) $foreignConfigDigest "Refused uninstall changed launcher config"
+      Assert-Equal $script:mockUserPath $foreignUserPath "Refused uninstall changed User PATH"
+      Assert-Equal $env:PATH $foreignProcessPath "Refused uninstall changed process PATH"
+      [IO.File]::Copy((Join-Path $scenario.Prefix "agy.exe.tpl"), $state.shimPath, $true)
+    }
     $foreignAfter = Join-Path $scenario.Directory "foreign-after"
     $script:mockUserPath += ";" + $foreignAfter
     $env:PATH += ";" + $foreignAfter
