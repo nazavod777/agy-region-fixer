@@ -1,0 +1,223 @@
+name: cross-platform-test
+
+# Runs the installer on Linux/Windows/macOS with a FAKE agy in PATH:
+# checks proxy+CA+MITM, shim mechanics, heal and uninstall.
+# Real agy login and Google traffic are not tested in CI.
+#
+# push to master — quick gate on ubuntu only (cheap);
+# full 3-OS matrix — manual workflow_dispatch (macOS ×10 minutes).
+
+on:
+  push:
+    branches: [master]
+    paths: [install.sh, install.ps1, addon.py, .github/workflows/cross-platform-test.yml]
+  workflow_dispatch:   # full 3-OS run on demand
+
+jobs:
+  install-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # push → ubuntu only; dispatch → all three OSes
+        os: ${{ github.event_name == 'workflow_dispatch' && fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Fake agy: the installer will find it, hide it as agy.real and install the shim.
+      # Padding to 12 MB with "x" characters in a comment: the file passes heal validation (≥10 MB)
+      # and still stays an executable shell script (everything after echo is commented out).
+      - name: Plant fake agy (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          { printf '#!/bin/sh\necho "fake-agy $@"\n#'   # no \n after #: the padding stays a comment
+            head -c 12000000 /dev/zero | tr '\0' 'x'
+          } > "$HOME/.local/bin/agy"
+          chmod +x "$HOME/.local/bin/agy"
+          "$HOME/.local/bin/agy" hi   # self-check: the padding did not break execution
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Plant fake agy (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "$env:USERPROFILE\agy-fake-bin"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          # copy of a system exe as the fake agy.exe + padding to 20 MB for heal validation
+          Copy-Item "C:\Windows\System32\where.exe" "$dir\agy.exe"
+          $fs = [IO.File]::OpenWrite("$dir\agy.exe"); $fs.SetLength(20MB); $fs.Close()
+          Add-Content $env:GITHUB_PATH $dir
+
+      - name: Run installer (unix)
+        if: runner.os != 'Windows'
+        run: |
+          if [[ "$(uname -s)" == "Linux" ]]; then
+            # GH runner is not root; sudo is passwordless but -E is ignored by it — pass PATH and port explicitly
+            sudo env "PATH=$PATH" "AGY_BYPASS_PORT=$AGY_BYPASS_PORT" bash install.sh
+          else
+            bash install.sh            # macOS: launchd as the user, sudo not needed
+          fi
+        env:
+          AGY_BYPASS_PORT: "8090"
+
+      - name: Run installer (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./install.ps1
+        env:
+          AGY_BYPASS_PORT: "8090"
+
+      - name: Verify proxy is listening and CA exists (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -e
+          PREFIX="/opt/agy-region-fixer"; [[ "$(uname -s)" == "Darwin" ]] && PREFIX="$HOME/.agy-region-fixer"
+          test -f "$PREFIX/ca/mitmproxy-ca-cert.pem"
+          curl -s --noproxy '*' -o /dev/null --max-time 5 http://127.0.0.1:8090/ || true
+          curl -s --max-time 15 --cacert "$PREFIX/ca/mitmproxy-ca-cert.pem" \
+            -x http://127.0.0.1:8090 -o /dev/null https://www.google.com/
+          echo "MITM OK"
+
+      - name: Verify shim and heal (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -e
+          PREFIX="/opt/agy-region-fixer"; [[ "$(uname -s)" == "Darwin" ]] && PREFIX="$HOME/.agy-region-fixer"
+          # Linux: the prefix is owned by root, heal is run via sudo (as in the README)
+          if [[ "$(uname -s)" == "Linux" ]]; then HEAL="sudo bash $PREFIX/heal.sh"; else HEAL="bash $PREFIX/heal.sh"; fi
+          AGY="$HOME/.local/bin/agy"
+          grep -q "agy-region-fixer-shim" "$AGY"
+          test -x "$AGY.real"
+          # simulate a CLI update
+          cp "$AGY.real" "$AGY"
+          $HEAL
+          grep -q "agy-region-fixer-shim" "$AGY"
+          # negative check: small junk over the shim — heal must not eat it
+          echo junk > "$AGY"
+          $HEAL
+          grep -q '^junk$' "$AGY" || { echo "FAIL: heal overwrote a small file"; exit 1; }
+          test -x "$AGY.real" || { echo "FAIL: heal touched agy.real"; exit 1; }
+          # race: three concurrent heals must not lose the real binary
+          cp "$AGY.real" "$AGY"
+          $HEAL & $HEAL & $HEAL & wait
+          grep -q "agy-region-fixer-shim" "$AGY"
+          if head -c 256 "$AGY.real" | grep -aq "agy-region-fixer-shim"; then echo "FAIL: agy.real turned out to be the shim"; exit 1; fi
+          [[ "$("$AGY" hi)" == *"fake-agy"* ]] || { echo "FAIL: agy does not run the real binary"; exit 1; }
+          # a planted agy.tmp symlink must not allow writing to a foreign file
+          echo SECRET > "$HOME/victim.txt"
+          cp "$AGY.real" "$AGY"; ln -s "$HOME/victim.txt" "$AGY.tmp"
+          $HEAL
+          [[ "$(cat "$HOME/victim.txt")" == "SECRET" ]] || { echo "FAIL: heal wrote through agy.tmp"; exit 1; }
+          rm -f "$AGY.tmp" "$HOME/victim.txt"
+          grep -q "agy-region-fixer-shim" "$AGY"
+          if [[ "$(uname -s)" == "Linux" ]]; then
+            # symlink agy -> system root file: heal runs as the owner and
+            # must reject such a write rather than perform it as root
+            sudo cp "$AGY.real" /usr/sbin/sysdaemon-test
+            cp "$AGY.real" "$HOME/agy.keep"
+            rm -f "$AGY"; ln -s /usr/sbin/sysdaemon-test "$AGY"
+            $HEAL
+            test ! -e /usr/sbin/sysdaemon-test.real || { echo "FAIL: heal followed the symlink into a system directory"; exit 1; }
+            if grep -q "agy-region-fixer-shim" /usr/sbin/sysdaemon-test; then echo "FAIL: heal rewrote a system file"; exit 1; fi
+            rm -f "$AGY"; cp "$HOME/agy.keep" "$AGY"; rm -f "$HOME/agy.keep"
+            sudo rm -f /usr/sbin/sysdaemon-test
+          fi
+          # restore the working state
+          cp "$AGY.real" "$AGY"
+          $HEAL
+          grep -q "agy-region-fixer-shim" "$AGY"
+          echo "SHIM+HEAL OK"
+
+      - name: Instant heal trigger (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -e
+          PREFIX="/opt/agy-region-fixer"; [[ "$(uname -s)" == "Darwin" ]] && PREFIX="$HOME/.agy-region-fixer"
+          AGY="$HOME/.local/bin/agy"
+          if [[ "$(uname -s)" == "Linux" ]]; then
+            systemctl is-active agy-region-fixer-heal.path
+            cp "$AGY.real" "$AGY"          # "an update arrived" — the path unit must fire on its own
+            for _ in $(seq 1 25); do grep -q "agy-region-fixer-shim" "$AGY" && break; sleep 1; done
+            grep -q "agy-region-fixer-shim" "$AGY" || { echo "FAIL: path unit did not restore the shim"; exit 1; }
+          else
+            # macOS: instant heal via WatchPaths (functionally exercises the launchd runner)
+            grep -q WatchPaths "$HOME/Library/LaunchAgents/com.agy.region-fixer-heal.plist"
+          fi
+          echo "INSTANT HEAL OK"
+
+      - name: Verify shim and heal (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $PREFIX = "$env:USERPROFILE\.agy-region-fixer"
+          $shim = "$env:USERPROFILE\agy-fake-bin\agy.cmd"
+          if (-not (Test-Path $shim)) { throw "shim agy.cmd was not created" }
+          if (-not (Select-String -Path $shim -Pattern "agy-region-fixer" -Quiet)) { throw "agy.cmd is not ours" }
+          if (-not (Test-Path "$env:USERPROFILE\agy-fake-bin\agy.real.exe")) { throw "agy.real.exe missing" }
+          $run = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue
+          if (-not $run."agy-region-fixer") { throw "HKCU Run entry was not created" }
+          # simulate a CLI update: put agy.exe back on top
+          Copy-Item "$env:USERPROFILE\agy-fake-bin\agy.real.exe" "$env:USERPROFILE\agy-fake-bin\agy.exe" -Force
+          powershell -File "$PREFIX\heal.ps1"
+          if (Test-Path "$env:USERPROFILE\agy-fake-bin\agy.exe") { throw "heal did not hide agy.exe" }
+          if (-not (Select-String -Path $shim -Pattern "agy-region-fixer" -Quiet)) { throw "heal did not restore agy.cmd" }
+          # negative check: small junk as agy.exe — heal must not hide it
+          Set-Content "$env:USERPROFILE\agy-fake-bin\agy.exe" "junk"
+          powershell -File "$PREFIX\heal.ps1"
+          if (-not (Test-Path "$env:USERPROFILE\agy-fake-bin\agy.exe")) { throw "heal ate a small file" }
+          if (-not (Test-Path "$env:USERPROFILE\agy-fake-bin\agy.real.exe")) { throw "heal touched agy.real.exe" }
+          echo "SHIM+HEAL+RUN OK"
+
+      - name: Uninstall and verify clean state (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -e
+          PREFIX="/opt/agy-region-fixer"; [[ "$(uname -s)" == "Darwin" ]] && PREFIX="$HOME/.agy-region-fixer"
+          if [[ "$(uname -s)" == "Linux" ]]; then
+            sudo bash "$PREFIX/uninstall.sh"
+          else
+            bash "$PREFIX/uninstall.sh"
+          fi
+          test ! -d "$PREFIX"
+          # the fake agy is restored and runs
+          out="$("$HOME/.local/bin/agy" hi)"
+          [[ "$out" == *"fake-agy"* ]]
+          echo "UNINSTALL OK"
+
+      # pipe scenario: install.sh WITHOUT addon.py next to it (like curl | bash) —
+      # the installer must fetch addon.py via AGY_ADDON_URL (file:// here, so the test
+      # tests the checked-out commit rather than whatever is on master) and substitute
+      # the placeholders
+      - name: Pipe-style install fetches addon.py (ubuntu only)
+        if: runner.os == 'Linux'
+        run: |
+          set -e
+          mkdir -p /tmp/pipe && cp install.sh /tmp/pipe/
+          ADDON_URL="file://$GITHUB_WORKSPACE/addon.py"
+          cd /tmp/pipe
+          sudo env "PATH=$PATH" "AGY_ADDON_URL=$ADDON_URL" AGY_BYPASS_PORT=8091 AGY_BYPASS_PREFIX=/opt/agy-pipe-test bash install.sh
+          grep -q 'ineligibleTiers' /opt/agy-pipe-test/addon.py
+          if grep -qE '@@LOG@@|@@VERBOSE_FLAG@@' /opt/agy-pipe-test/addon.py; then echo "FAIL: placeholders were not substituted"; exit 1; fi
+          test -f /opt/agy-pipe-test/ca/mitmproxy-ca-cert.pem
+          sudo bash /opt/agy-pipe-test/uninstall.sh
+          test ! -d /opt/agy-pipe-test
+          out="$("$HOME/.local/bin/agy" hi)"
+          [[ "$out" == *"fake-agy"* ]]
+          echo "PIPE INSTALL OK"
+
+      - name: Uninstall and verify clean state (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $PREFIX = "$env:USERPROFILE\.agy-region-fixer"
+          powershell -ExecutionPolicy Bypass -File "$PREFIX\uninstall.ps1"
+          if (Test-Path $PREFIX) { throw "prefix was not removed" }
+          if (-not (Test-Path "$env:USERPROFILE\agy-fake-bin\agy.exe")) { throw "agy.exe was not restored" }
+          echo "UNINSTALL OK"
