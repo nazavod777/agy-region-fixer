@@ -436,6 +436,46 @@ class LauncherFixture {
     Assert-True (@($env:PATH -split ';' | Where-Object { $_ -ieq $oldOverlayDirectory }).Count -eq 0) "Migration or uninstall retained its previous process PATH entry"
   }
 
+  # Switching away from an uninstalled plain EXE must also rediscover the CLI.
+  $migration = New-Scenario "missing-inplace-target-to-cmd"
+  $oldExecutable = Join-Path $migration.Bin "agy.exe"
+  Copy-PaddedFixture $oldExecutable
+  $oldState = Install-Scenario $migration $port
+  [IO.File]::Delete($oldState.target)
+  $replacementDirectory = Join-Path $migration.Directory "replacement-cli"
+  New-Item -ItemType Directory -Path $replacementDirectory | Out-Null
+  $replacementTarget = Write-CmdFixture $replacementDirectory
+  $replacementDigest = Get-Digest $replacementTarget
+  $userPathBeforeMigration = $script:mockUserPath
+  $env:PATH = $migration.Bin + ";" + $replacementDirectory + ";" + $systemPath
+  $state = Install-Scenario $migration $port
+  Assert-Equal $state.mode "overlay" "Missing in-place target did not switch to managed launcher mode"
+  Assert-Equal $state.target $replacementTarget "Missing in-place target masked the replacement CMD"
+  Assert-True (-not [IO.File]::Exists($oldState.shimPath)) "Migration retained the obsolete in-place shim"
+  Assert-True (-not [IO.File]::Exists((Join-Path $migration.Bin "agy-launcher.json"))) "Migration retained the obsolete in-place config"
+  Assert-Configuration $state $port "cmd"
+  Assert-ProxyEnvironment (Invoke-Fixture $state.shimPath @("migrated from EXE")) $port $false
+  Remove-AgyWindowsShim -Prefix $migration.Prefix | Out-Null
+  Assert-Equal (Get-Digest $replacementTarget) $replacementDigest "Uninstall changed the replacement CMD after in-place migration"
+  Assert-Equal $script:mockUserPath $userPathBeforeMigration "Uninstall retained its new overlay PATH entry"
+  Assert-True (@($env:PATH -split ';' | Where-Object { $_ -ieq $migration.Bin }).Count -eq 1) "Migration removed an original process PATH entry"
+
+  # A replacement at the original EXE path remains an update, even when its
+  # backup disappeared; it must not be mistaken for a stale installation.
+  $recovery = New-Scenario "missing-backup-with-cli-update"
+  $updatedExecutable = Join-Path $recovery.Bin "agy.exe"
+  Copy-PaddedFixture $updatedExecutable
+  $state = Install-Scenario $recovery $port
+  [IO.File]::Delete($state.target)
+  Copy-PaddedFixture $updatedExecutable 13MB
+  $updatedDigest = Get-Digest $updatedExecutable
+  $state = Install-Scenario $recovery $port
+  Assert-Equal $state.mode "inplace" "Missing backup relocated a valid CLI update"
+  Assert-Equal (Get-Digest $state.target) $updatedDigest "Missing backup prevented retaining the CLI update"
+  Assert-ProxyEnvironment (Invoke-Fixture $state.shimPath @("recovered CLI update")) $port $false
+  Remove-AgyWindowsShim -Prefix $recovery.Prefix | Out-Null
+  Assert-Equal (Get-Digest $updatedExecutable) $updatedDigest "Uninstall lost the recovered CLI update"
+
   foreach ($kind in @("cmd", "ps1", "scoop", "windowsapps-path")) {
     $scenario = New-Scenario $kind
     if ($kind -eq "windowsapps-path") {
@@ -498,6 +538,11 @@ exit ([int]$env:AGY_TEST_EXIT)
     Assert-Equal $state.target $target "Reinstallation targeted its own overlay"
     $record = Invoke-Fixture $state.shimPath $arguments "overlay stdin`r`n"
     Assert-ProxyEnvironment $record $port $false
+    if ($kind -eq "ps1") {
+      foreach ($argumentCase in @(@(), @(""), @("single argument"))) {
+        Invoke-Fixture $state.shimPath $argumentCase | Out-Null
+      }
+    }
     if ($targetKind -ne "exe") { Assert-Equal $record.environment.AGY_TEST_LAUNCHER_NAME "agy" "Original launcher basename was not preserved" }
     [IO.File]::Delete($state.shimPath)
     Repair-AgyWindowsShim -Prefix $scenario.Prefix | Out-Null

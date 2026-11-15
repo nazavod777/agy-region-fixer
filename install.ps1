@@ -643,18 +643,26 @@ function Install-AgyWindowsShim {
     param($root)
     $savedState = Read-AgyShimState $root
     $state = $savedState
-    $previousOverlay = $null
-    if ($savedState -and $savedState.mode -eq 'overlay' -and -not [IO.File]::Exists($savedState.target)) {
+    $previousState = $null
+    $rediscover = $false
+    if ($savedState -and -not [IO.File]::Exists($savedState.target)) {
+      $savedShimExists = [IO.File]::Exists($savedState.shimPath)
+      $savedShimOwned = Test-AgyNativeShim $savedState.shimPath
+      # An in-place update can recreate agy.exe before its saved original exists.
+      # Keep that path in the normal stable-PE recovery flow.
+      $rediscover = $savedState.mode -eq 'overlay' -or -not $savedShimExists -or $savedShimOwned
+    }
+    if ($rediscover) {
       [void](Assert-AgyOwnedConfig $savedState)
-      if ([IO.File]::Exists($savedState.shimPath) -and -not (Test-AgyNativeShim $savedState.shimPath)) {
-        throw "Refusing to replace a foreign overlay executable: $($savedState.shimPath)"
+      if ($savedShimExists -and -not $savedShimOwned) {
+        throw "Refusing to replace a foreign saved executable: $($savedState.shimPath)"
       }
-      $previousOverlay = $savedState
+      $previousState = $savedState
       $state = Get-AgyCommandTarget $root
-      if ($state.mode -eq 'overlay') {
+      if ($state.mode -eq 'overlay' -and $previousState.mode -eq 'overlay') {
         # The same private wrapper keeps ownership of its existing PATH entries.
-        $state.pathAdded = $previousOverlay.pathAdded
-        $state | Add-Member -NotePropertyName processPathAdded -NotePropertyValue $previousOverlay.processPathAdded
+        $state.pathAdded = $previousState.pathAdded
+        $state | Add-Member -NotePropertyName processPathAdded -NotePropertyValue $previousState.processPathAdded
       }
     }
     $legacy = $null
@@ -663,14 +671,14 @@ function Install-AgyWindowsShim {
     if ($legacyPath -and -not (Test-AgyLegacyShim $legacyPath)) { throw "The legacy shim is no longer owned: $legacyPath" }
     if (-not $state) { $state = Get-AgyCommandTarget $root }
     $configPath = Join-Path (Split-Path -Parent $state.shimPath) 'agy-launcher.json'
-    $reuseOverlay = $previousOverlay -and (Test-AgySamePath $state.shimPath $previousOverlay.shimPath)
-    if ($previousOverlay) {
-      if (-not $reuseOverlay -and [IO.File]::Exists($configPath)) {
+    $reuseShim = $previousState -and (Test-AgySamePath $state.shimPath $previousState.shimPath)
+    if ($previousState) {
+      if (-not $reuseShim -and [IO.File]::Exists($configPath)) {
         throw "Refusing to replace a foreign launcher configuration: $configPath"
       }
     } elseif ($savedState) { [void](Assert-AgyOwnedConfig $state) }
     elseif ([IO.File]::Exists($configPath)) { throw "Refusing to replace a foreign launcher configuration: $configPath" }
-    if ((-not $savedState -or $previousOverlay) -and -not $legacy -and $state.mode -eq 'inplace' -and [IO.File]::Exists($state.target)) {
+    if ((-not $savedState -or $previousState) -and -not $legacy -and $state.mode -eq 'inplace' -and [IO.File]::Exists($state.target)) {
       throw "Refusing to replace an existing original-binary backup: $($state.target)"
     }
     if ($state.mode -eq 'overlay') {
@@ -691,7 +699,7 @@ function Install-AgyWindowsShim {
       $replaceOriginal = $false
       if ($state.mode -eq 'inplace') {
         if ([IO.File]::Exists($state.shimPath) -and -not (Test-AgyNativeShim $state.shimPath)) {
-          if ((($savedState -and -not $previousOverlay) -or $legacy) -and -not (Test-AgyStableUpdate $state.shimPath)) {
+          if ((($savedState -and -not $previousState) -or $legacy) -and -not (Test-AgyStableUpdate $state.shimPath)) {
             throw "The replacement agy.exe is incomplete or suspicious; it was left untouched: $($state.shimPath)"
           }
           $replaceOriginal = $true
@@ -712,22 +720,24 @@ function Install-AgyWindowsShim {
       if ($state.mode -eq 'overlay') { $pathChanged = $true; Add-AgyOverlayPath $state }
       $config = [ordered]@{ version = 1; target = $state.target; kind = $state.kind; port = $Port; certificate = $Certificate }
       Set-AgyNativeFiles $transaction $state $nativeTemplate $config -ReplaceOriginal:$replaceOriginal
-      if ($previousOverlay -and -not $reuseOverlay) {
+      if ($previousState -and -not $reuseShim) {
         # Retire the old wrapper only after the new CLI and its config are ready.
-        $previousConfig = Assert-AgyOwnedConfig $previousOverlay
-        if ([IO.File]::Exists($previousOverlay.shimPath)) {
-          if (-not (Test-AgyNativeShim $previousOverlay.shimPath)) {
-            throw "The previous overlay executable is no longer owned: $($previousOverlay.shimPath)"
+        $previousConfig = Assert-AgyOwnedConfig $previousState
+        if ([IO.File]::Exists($previousState.shimPath)) {
+          if (-not (Test-AgyNativeShim $previousState.shimPath)) {
+            throw "The previous executable is no longer owned: $($previousState.shimPath)"
           }
-          Remove-AgyTransactionFile $transaction $previousOverlay.shimPath
+          Remove-AgyTransactionFile $transaction $previousState.shimPath
         }
         Remove-AgyTransactionFile $transaction $previousConfig
-        $pathChanged = $true
-        if ($previousOverlay.pathAdded) {
-          Set-AgyUserPath -Value (Get-AgyPathWithoutEntry (Get-AgyUserPath) $previousOverlay.pathEntry)
-        }
-        if ($previousOverlay.pathAdded -or $previousOverlay.processPathAdded) {
-          $env:Path = Get-AgyPathWithoutEntry $env:Path $previousOverlay.pathEntry
+        if ($previousState.mode -eq 'overlay') {
+          $pathChanged = $true
+          if ($previousState.pathAdded) {
+            Set-AgyUserPath -Value (Get-AgyPathWithoutEntry (Get-AgyUserPath) $previousState.pathEntry)
+          }
+          if ($previousState.pathAdded -or $previousState.processPathAdded) {
+            $env:Path = Get-AgyPathWithoutEntry $env:Path $previousState.pathEntry
+          }
         }
       }
       if ($legacyPath) {
@@ -1105,10 +1115,12 @@ internal static class Launcher
             string targetLiteral = Convert.ToBase64String(Encoding.Unicode.GetBytes(configuration.Target));
             string json = new JavaScriptSerializer().Serialize(arguments);
             string argumentsLiteral = Convert.ToBase64String(Encoding.Unicode.GetBytes(json));
+            // Windows PowerShell emits JSON arrays as one pipeline object. Cast
+            // directly so an array subexpression cannot nest it before splatting.
             string script = "$ProgressPreference='SilentlyContinue';$target=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('" +
-                targetLiteral + "'));$arguments=@(ConvertFrom-Json -InputObject " +
+                targetLiteral + "'));$arguments=[string[]](ConvertFrom-Json -InputObject " +
                 "([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('" + argumentsLiteral +
-                "'))));& $target @arguments;$succeeded=$?;" +
+                "'))));if($null -eq $arguments){$arguments=[string[]]@()};& $target @arguments;$succeeded=$?;" +
                 "if($null -ne $LASTEXITCODE){exit $LASTEXITCODE};if($succeeded){exit 0}else{exit 1}";
             start.Arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -InputFormat Text -OutputFormat Text -EncodedCommand " +
                 Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
