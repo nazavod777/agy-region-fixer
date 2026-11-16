@@ -2,9 +2,9 @@
 
 <img src="assets/hero.svg" width="800" alt="Installer runs six steps, then agy replies BYPASS_OK"><br><br>
 
-<img src="assets/linux.svg" height="28" alt="Linux"> <img src="assets/macos.svg" height="28" alt="macOS"> <img src="assets/windows.svg" height="28" alt="Windows"><br>
-<img src="assets/bash.svg" height="28" alt="Bash"> <img src="assets/powershell.svg" height="28" alt="PowerShell"> <img src="assets/python.svg" height="28" alt="Python"><br>
-<img src="assets/mitmproxy.svg" height="28" alt="mitmproxy"> <img src="assets/selfheal.svg" height="28" alt="self-healing"> <img src="assets/noroot.svg" height="28" alt="heal runs as file owner"> <img src="assets/license.svg" height="28" alt="MIT"><br><br>
+<img src="assets/b-linux.svg" height="28" alt="Linux"> <img src="assets/b-macos.svg" height="28" alt="macOS"> <img src="assets/b-windows.svg" height="28" alt="Windows"><br>
+<img src="assets/b-bash.svg" height="28" alt="Bash"> <img src="assets/b-powershell.svg" height="28" alt="PowerShell"> <img src="assets/b-python.svg" height="28" alt="Python"><br>
+<img src="assets/b-mitmproxy.svg" height="28" alt="mitmproxy"> <img src="assets/b-selfheal.svg" height="28" alt="self-healing"> <img src="assets/b-noroot.svg" height="28" alt="heal runs as file owner"> <img src="assets/b-license.svg" height="28" alt="MIT"><br><br>
 
 <a href="README.md">🇬🇧 English</a> · <a href="README.ru.md">🇷🇺 Русский</a> · <a href="README.zh.md">🇨🇳 中文</a>
 
@@ -15,7 +15,7 @@
 
 # 🌍 agy-region-fixer
 
-> **Antigravity CLI region-block bypass** — one installer for 🐧 Linux, 🍎 macOS and 🪟 Windows that survives CLI updates.
+> **Antigravity CLI region-block bypass** — one installer for <img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux">, <img src="assets/c-macos.svg" height="20" align="absmiddle" alt="macOS"> and <img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows"> that survives CLI updates.
 
 Google restricts access by the account's country. A local MITM proxy strips `ineligibleTiers` from the `loadCodeAssist` response — the CLI sees only `allowedTiers` and lets you in. Requests to Google are **not modified**, the `agy` binary is **not patched**.
 
@@ -56,21 +56,21 @@ Exactly **one** thing — the region warning that Antigravity CLI shows right af
 Install and log in to Antigravity CLI first (`agy login`), then:
 
 <table>
-<tr><td>🐧 <b>Linux</b><br><sub>systemd: Ubuntu, Debian, Kali, Fedora, Arch, openSUSE</sub></td><td>
+<tr><td width="260"><img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux"><br><sub>systemd: Ubuntu, Debian, Kali, Fedora, Arch, openSUSE</sub></td><td>
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nazavod777/agy-region-fixer/master/install.sh | sudo bash
 ```
 
 </td></tr>
-<tr><td>🍎 <b>macOS</b><br><sub>12+, Xcode Command Line Tools</sub></td><td>
+<tr><td width="260"><img src="assets/c-macos.svg" height="20" align="absmiddle" alt="macOS"><br><sub>12+, Xcode Command Line Tools</sub></td><td>
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nazavod777/agy-region-fixer/master/install.sh | bash
 ```
 
 </td></tr>
-<tr><td>🪟 <b>Windows 10/11</b><br><sub>Python 3.12/3.13 from python.org, no admin rights needed</sub></td><td>
+<tr><td width="260"><img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows"><br><sub>10/11 · Python 3.12/3.13 from python.org, no admin rights needed</sub></td><td>
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://raw.githubusercontent.com/nazavod777/agy-region-fixer/master/install.ps1)"
@@ -86,13 +86,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://raw.git
 
 ### 📋 Requirements
 
-- 🐍 Python **3.12 or 3.13** (required by mitmproxy 12.x), a complete build with `ctypes`, `ssl` and `zlib`. The installer checks every `python3.13`/`python3.12`/`python3` on `PATH` and skips incomplete ones — e.g. a self-built Python without `libffi-dev`
-- 🌐 `curl`, and an installed, logged-in Antigravity CLI
+- <img src="assets/c-python.svg" height="20" align="absmiddle" alt="Python"> **3.12 or 3.13** (required by mitmproxy 12.x), a complete build with `ctypes`, `ssl` and `zlib`. The installer checks every `python3.13`/`python3.12`/`python3` on `PATH` and skips incomplete ones — e.g. a self-built Python without `libffi-dev`
+- <img src="assets/c-curl.svg" height="20" align="absmiddle" alt="curl">, and an installed, logged-in Antigravity CLI
 - 📦 **Any way of installing `agy`** — the installer finds it the way your own shell does (`sudo` hides `~/.local/bin`, `/snap/bin`, nvm, bun, cargo…):
-  - a plain binary, an npm/brew/cargo link, a root-owned `/usr/local/bin/agy` → the binary is moved to `agy.real` and replaced by the shim;
-  - **snap, Nix** (a launcher that must not be touched) → the launcher stays as is, and a wrapper is placed earlier in your `PATH` (`~/.local/bin`). For a snap the CA certificate is copied into `~/snap/<name>/common/agy-region-fixer`, where the confined app can read it.
-- 🪟 **One Windows installer for all supported formats:** `install.ps1` detects a plain EXE, npm `.cmd`/`.ps1`, a WindowsApps alias or a Scoop shim. It builds a real `agy.exe` wrapper using the .NET Framework compiler included with Windows. Plain binaries are saved as `agy.real.exe`; managed launchers keep their names and files, with the wrapper in `%USERPROFILE%\.agy-region-fixer\bin`. Old `agy.cmd` installations are migrated automatically.
-- 🐧 Linux: systemd plus `runuser` or `setpriv` (both ship in `util-linux`)
+  - <img src="assets/c-npm.svg" height="20" align="absmiddle" alt="npm"> <img src="assets/c-nodejs.svg" height="20" align="absmiddle" alt="Node.js"> <img src="assets/c-bun.svg" height="20" align="absmiddle" alt="Bun"> <img src="assets/c-homebrew.svg" height="20" align="absmiddle" alt="Homebrew"> <img src="assets/c-cargo.svg" height="20" align="absmiddle" alt="Cargo"> a plain binary, an npm/brew/cargo link, a root-owned `/usr/local/bin/agy` → the binary is moved to `agy.real` and replaced by the shim;
+  - <img src="assets/c-snap.svg" height="20" align="absmiddle" alt="Snap"> <img src="assets/c-nix.svg" height="20" align="absmiddle" alt="Nix"> **snap, Nix** (a launcher that must not be touched) → the launcher stays as is, and a wrapper is placed earlier in your `PATH` (`~/.local/bin`). For a snap the CA certificate is copied into `~/snap/<name>/common/agy-region-fixer`, where the confined app can read it.
+- <img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows"> **One Windows installer for all supported formats:** `install.ps1` detects a plain EXE, npm `.cmd`/`.ps1`, a WindowsApps alias or a Scoop shim. It builds a real `agy.exe` wrapper using the .NET Framework compiler included with Windows. Plain binaries are saved as `agy.real.exe`; managed launchers keep their names and files, with the wrapper in `%USERPROFILE%\.agy-region-fixer\bin`. Old `agy.cmd` installations are migrated automatically.
+- <img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux"> systemd plus `runuser` or `setpriv` (both ship in `util-linux`)
 
 ## ⚙️ How it works
 
@@ -116,9 +116,9 @@ File-system events trigger shim repair after a CLI update. A five-minute fallbac
 
 | OS | Event trigger | Fallback |
 |---|---|---|
-| 🐧 Linux | systemd path unit with `PathChanged` | systemd timer |
-| 🍎 macOS | launchd `WatchPaths` | separate `StartInterval` job |
-| 🪟 Windows | .NET `FileSystemWatcher`, started at installation and user logon | scheduled task `agy-region-fixer-heal` |
+| <img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux"> | systemd path unit with `PathChanged` | systemd timer |
+| <img src="assets/c-macos.svg" height="20" align="absmiddle" alt="macOS"> | launchd `WatchPaths` | separate `StartInterval` job |
+| <img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows"> | .NET `FileSystemWatcher`, started at installation and user logon | scheduled task `agy-region-fixer-heal` |
 
 Events are coalesced before repair. The healer waits for a quiet candidate and checks its size (≥ 10 MB; on Windows also the `MZ` signature). It uses a lock, a staged copy and rollback checks to reduce races and preserve the previous working copy. These checks are a readiness heuristic: a quiet file does not prove that an arbitrary updater has finished.
 
@@ -128,9 +128,9 @@ On Windows, moving or renaming higher-level directories, such as the user profil
 
 Run repair manually:
 
-- 🐧 `sudo agy-bypass-heal`
-- 🍎 `bash ~/.agy-region-fixer/heal.sh`
-- 🪟 `powershell %USERPROFILE%\.agy-region-fixer\heal.ps1`
+- <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"> `sudo agy-bypass-heal`
+- <img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"> `bash ~/.agy-region-fixer/heal.sh`
+- <img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> `powershell %USERPROFILE%\.agy-region-fixer\heal.ps1`
 
 ## 🔐 Security model
 
@@ -146,10 +146,10 @@ On Linux heal is started by root (systemd) while the directory holding `agy` usu
 
 | Variable | Default | Purpose | OS |
 |---|---|---|---|
-| `AGY_BYPASS_PORT` | automatic | proxy port | 🐧 🍎 🪟 |
-| `AGY_BYPASS_PREFIX` | `/opt/agy-region-fixer` · `~/.agy-region-fixer` | install directory | 🐧 🍎 |
-| `AGY_BYPASS_BIN` | `agy` found in `PATH` | path to the CLI binary | 🐧 🍎 |
-| `AGY_ADDON_URL` | raw.githubusercontent.com | where to fetch `addon.py` for a piped install | 🐧 🍎 🪟 |
+| `AGY_BYPASS_PORT` | automatic | proxy port | <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"><img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"><img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> |
+| `AGY_BYPASS_PREFIX` | `/opt/agy-region-fixer` · `~/.agy-region-fixer` | install directory | <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"><img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"> |
+| `AGY_BYPASS_BIN` | `agy` found in `PATH` | path to the CLI binary | <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"><img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"> |
+| `AGY_ADDON_URL` | raw.githubusercontent.com | where to fetch `addon.py` for a piped install | <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"><img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"><img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> |
 
 The default is a randomly selected free localhost port in `49152–65535`, saved in `<install directory>/port`. A reinstall reuses that high port when available; otherwise it selects another. `AGY_BYPASS_PORT` explicitly fixes the port and fails if it is occupied. The installer prints the actual address and updates the proxy and all wrappers together. Ctrl+C stops the installer and its temporary commands; an already started background proxy remains until you run uninstall.
 
@@ -162,9 +162,9 @@ $env:AGY_BYPASS_PORT="8081"; powershell -ExecutionPolicy Bypass -File install.ps
 
 ## 🧹 Uninstall
 
-- 🐧 `sudo /opt/agy-region-fixer/uninstall.sh`
-- 🍎 `bash ~/.agy-region-fixer/uninstall.sh`
-- 🪟 `powershell -ExecutionPolicy Bypass -File %USERPROFILE%\.agy-region-fixer\uninstall.ps1`
+- <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"> `sudo /opt/agy-region-fixer/uninstall.sh`
+- <img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"> `bash ~/.agy-region-fixer/uninstall.sh`
+- <img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> `powershell -ExecutionPolicy Bypass -File %USERPROFILE%\.agy-region-fixer\uninstall.ps1`
 
 Removes the proxy, tasks and shim; the `agy` binary goes back in place — even if an interrupted update left it only as `agy.real`.
 
@@ -172,9 +172,9 @@ Removes the proxy, tasks and shim; the `agy` binary goes back in place — even 
 
 | OS | Proxy log | Service log |
 |---|---|---|
-| 🐧 Linux | `/opt/agy-region-fixer/mitm.log` | `journalctl -u agy-region-fixer -e` |
-| 🍎 macOS | `~/.agy-region-fixer/mitm.log` | `~/.agy-region-fixer/launchd.err` |
-| 🪟 Windows | `%USERPROFILE%\.agy-region-fixer\mitm.log` | `…\mitm-stdout.log` |
+| <img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux"> | `/opt/agy-region-fixer/mitm.log` | `journalctl -u agy-region-fixer -e` |
+| <img src="assets/c-macos.svg" height="20" align="absmiddle" alt="macOS"> | `~/.agy-region-fixer/mitm.log` | `~/.agy-region-fixer/launchd.err` |
+| <img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows"> | `%USERPROFILE%\.agy-region-fixer\mitm.log` | `…\mitm-stdout.log` |
 
 🔎 **Verbose mode:** logging every URL is switched on with a `verbose.flag` file in the install directory (`touch /opt/agy-region-fixer/verbose.flag`; on Windows create the file in `%USERPROFILE%\.agy-region-fixer`). No proxy restart needed — the flag is checked on every request; delete the file to turn it off.
 
@@ -184,7 +184,7 @@ The proxy runs `addon.py` directly with the venv's Python (`python -I addon.py -
 
 ## ⚠️ Limitations
 
-- 🪟 For launcher-based Windows installations, open a new terminal after installation to pick up the updated user `PATH`. Programs must resolve the installed `agy.exe` wrapper or launch its full path; an absolute call to the original managed launcher bypasses it. A system `PATH` entry can take precedence over the user `PATH`; check which `agy` your application resolves.
+- <img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> For launcher-based Windows installations, open a new terminal after installation to pick up the updated user `PATH`. Programs must resolve the installed `agy.exe` wrapper or launch its full path; an absolute call to the original managed launcher bypasses it. A system `PATH` entry can take precedence over the user `PATH`; check which `agy` your application resolves.
 - 🧬 If Google changes the response format (renames the field or moves to binary proto) the addon stops cleaning; fixed with a one-line change in `addon.py`.
 - 📌 If `agy` starts certificate pinning (Go clients almost never do) this approach would need rework.
 
@@ -192,7 +192,7 @@ The proxy runs `addon.py` directly with the venv's Python (`python -I addon.py -
 
 The native GitHub Actions jobs linked below passed. Linux and macOS were tested at `bc1495b`; Windows passed at `2cda8ef`, after changes limited to the Windows installer, watcher tests and Windows CI step.
 
-| 🐧 ubuntu-latest | 🍎 macos-latest | 🪟 windows-latest |
+| <img src="assets/c-ubuntu.svg" height="20" align="absmiddle" alt="ubuntu-latest"> | <img src="assets/c-macos-latest.svg" height="20" align="absmiddle" alt="macos-latest"> | <img src="assets/c-windows-latest.svg" height="20" align="absmiddle" alt="windows-latest"> |
 |:---:|:---:|:---:|
 | [✅ systemd](https://github.com/nazavod777/agy-region-fixer/actions/runs/43772344364/job/132990856460) | [✅ launchd](https://github.com/nazavod777/agy-region-fixer/actions/runs/43772344364/job/132990856534) | [✅ HKCU Run + schtasks](https://github.com/nazavod777/agy-region-fixer/actions/runs/43773308497/job/132993835041) |
 
@@ -216,7 +216,7 @@ agy-region-fixer/
 | Role | Who |
 |---|---|
 | 👤 **Author & maintainer** | [**nazavod777**](https://github.com/nazavod777) |
-| 🤖 **Built with AI tools** | **Claude** & **Claude Code** (Anthropic) · **Hermes** (agent harness) · **GLM** models (Z.ai) · **T3 Code** (terminal) |
+| 🤖 **Built with AI tools** | <img src="assets/c-claude.svg" height="20" align="absmiddle" alt="Claude Code"> (Anthropic) · <img src="assets/c-hermes.svg" height="20" align="absmiddle" alt="Hermes"> (agent harness) · <img src="assets/c-zai.svg" height="20" align="absmiddle" alt="GLM Z.ai"> models · <img src="assets/c-t3code.svg" height="20" align="absmiddle" alt="T3 Code"> (terminal) |
 
 The AI tools above were used as development assistants — thanks to their teams. Design decisions, review and responsibility for the code stay with the author.
 

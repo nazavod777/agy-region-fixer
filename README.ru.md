@@ -2,9 +2,9 @@
 
 <img src="assets/hero.svg" width="800" alt="Installer runs six steps, then agy replies BYPASS_OK"><br><br>
 
-<img src="assets/linux.svg" height="28" alt="Linux"> <img src="assets/macos.svg" height="28" alt="macOS"> <img src="assets/windows.svg" height="28" alt="Windows"><br>
-<img src="assets/bash.svg" height="28" alt="Bash"> <img src="assets/powershell.svg" height="28" alt="PowerShell"> <img src="assets/python.svg" height="28" alt="Python"><br>
-<img src="assets/mitmproxy.svg" height="28" alt="mitmproxy"> <img src="assets/selfheal.svg" height="28" alt="self-healing"> <img src="assets/noroot.svg" height="28" alt="heal runs as file owner"> <img src="assets/license.svg" height="28" alt="MIT"><br><br>
+<img src="assets/b-linux.svg" height="28" alt="Linux"> <img src="assets/b-macos.svg" height="28" alt="macOS"> <img src="assets/b-windows.svg" height="28" alt="Windows"><br>
+<img src="assets/b-bash.svg" height="28" alt="Bash"> <img src="assets/b-powershell.svg" height="28" alt="PowerShell"> <img src="assets/b-python.svg" height="28" alt="Python"><br>
+<img src="assets/b-mitmproxy.svg" height="28" alt="mitmproxy"> <img src="assets/b-selfheal.svg" height="28" alt="self-healing"> <img src="assets/b-noroot.svg" height="28" alt="heal runs as file owner"> <img src="assets/b-license.svg" height="28" alt="MIT"><br><br>
 
 <a href="README.md">🇬🇧 English</a> · <a href="README.ru.md">🇷🇺 Русский</a> · <a href="README.zh.md">🇨🇳 中文</a>
 
@@ -15,7 +15,7 @@
 
 # 🌍 agy-region-fixer
 
-> **Обход региональной блокировки Antigravity CLI** — один установщик, который работает на 🐧 Linux, 🍎 macOS и 🪟 Windows и переживает обновления CLI.
+> **Обход региональной блокировки Antigravity CLI** — один установщик, который работает на <img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux">, <img src="assets/c-macos.svg" height="20" align="absmiddle" alt="macOS"> и <img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows"> и переживает обновления CLI.
 
 Google режет доступ по стране аккаунта. Локальный MITM-прокси вычищает `ineligibleTiers` из ответа `loadCodeAssist` — CLI видит только `allowedTiers` и пускает пользователя. Запросы к Google **не изменяются**, бинарь `agy` **не патчится**.
 
@@ -56,21 +56,21 @@ Google режет доступ по стране аккаунта. Локаль�
 Сначала установи и залогинь Antigravity CLI (`agy login`), затем:
 
 <table>
-<tr><td>🐧 <b>Linux</b><br><sub>systemd: Ubuntu, Debian, Kali, Fedora, Arch, openSUSE</sub></td><td>
+<tr><td width="260"><img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux"><br><sub>systemd: Ubuntu, Debian, Kali, Fedora, Arch, openSUSE</sub></td><td>
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nazavod777/agy-region-fixer/master/install.sh | sudo bash
 ```
 
 </td></tr>
-<tr><td>🍎 <b>macOS</b><br><sub>12+, Xcode Command Line Tools</sub></td><td>
+<tr><td width="260"><img src="assets/c-macos.svg" height="20" align="absmiddle" alt="macOS"><br><sub>12+, Xcode Command Line Tools</sub></td><td>
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nazavod777/agy-region-fixer/master/install.sh | bash
 ```
 
 </td></tr>
-<tr><td>🪟 <b>Windows 10/11</b><br><sub>Python 3.12/3.13 с python.org, права администратора не нужны</sub></td><td>
+<tr><td width="260"><img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows"><br><sub>10/11 · Python 3.12/3.13 с python.org, права администратора не нужны</sub></td><td>
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://raw.githubusercontent.com/nazavod777/agy-region-fixer/master/install.ps1)"
@@ -86,13 +86,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://raw.git
 
 ### 📋 Требования
 
-- 🐍 Python **3.12 или 3.13** (так требует mitmproxy 12.x), полная сборка с `ctypes`, `ssl` и `zlib`. Установщик проверяет все `python3.13`/`python3.12`/`python3` в `PATH` и пропускает неполные — например, Python, собранный из исходников без `libffi-dev`
-- 🌐 `curl`, установленный и залогиненный Antigravity CLI
+- <img src="assets/c-python.svg" height="20" align="absmiddle" alt="Python"> **3.12 или 3.13** (так требует mitmproxy 12.x), полная сборка с `ctypes`, `ssl` и `zlib`. Установщик проверяет все `python3.13`/`python3.12`/`python3` в `PATH` и пропускает неполные — например, Python, собранный из исходников без `libffi-dev`
+- <img src="assets/c-curl.svg" height="20" align="absmiddle" alt="curl">, установленный и залогиненный Antigravity CLI
 - 📦 **Любой способ установки `agy`** — установщик ищет его так же, как твоя оболочка (`sudo` прячет `~/.local/bin`, `/snap/bin`, nvm, bun, cargo…):
-  - обычный бинарь, ссылка от npm/brew/cargo, `/usr/local/bin/agy` под root → бинарь переносится в `agy.real`, вместо него встаёт shim;
-  - **snap, Nix** (лаунчер, который нельзя трогать) → лаунчер остаётся как есть, а обёртка ставится раньше него в твоём `PATH` (`~/.local/bin`). Для snap сертификат CA копируется в `~/snap/<имя>/common/agy-region-fixer`, где приложение под ограничениями может его прочитать.
-- 🪟 **Один установщик Windows для всех поддерживаемых форматов:** `install.ps1` определяет обычный EXE, npm `.cmd`/`.ps1`, алиас WindowsApps или shim Scoop. Настоящая обёртка `agy.exe` собирается встроенным компилятором .NET Framework. Обычный бинарь сохраняется как `agy.real.exe`; управляемые лаунчеры сохраняют имена и файлы, а обёртка помещается в `%USERPROFILE%\.agy-region-fixer\bin`. Старые установки с `agy.cmd` мигрируют автоматически.
-- 🐧 Linux: systemd и `runuser` или `setpriv` (оба из `util-linux`, есть везде)
+  - <img src="assets/c-npm.svg" height="20" align="absmiddle" alt="npm"> <img src="assets/c-nodejs.svg" height="20" align="absmiddle" alt="Node.js"> <img src="assets/c-bun.svg" height="20" align="absmiddle" alt="Bun"> <img src="assets/c-homebrew.svg" height="20" align="absmiddle" alt="Homebrew"> <img src="assets/c-cargo.svg" height="20" align="absmiddle" alt="Cargo"> обычный бинарь, ссылка от npm/brew/cargo, `/usr/local/bin/agy` под root → бинарь переносится в `agy.real`, вместо него встаёт shim;
+  - <img src="assets/c-snap.svg" height="20" align="absmiddle" alt="Snap"> <img src="assets/c-nix.svg" height="20" align="absmiddle" alt="Nix"> **snap, Nix** (лаунчер, который нельзя трогать) → лаунчер остаётся как есть, а обёртка ставится раньше него в твоём `PATH` (`~/.local/bin`). Для snap сертификат CA копируется в `~/snap/<имя>/common/agy-region-fixer`, где приложение под ограничениями может его прочитать.
+- <img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows"> **Один установщик Windows для всех поддерживаемых форматов:** `install.ps1` определяет обычный EXE, npm `.cmd`/`.ps1`, алиас WindowsApps или shim Scoop. Настоящая обёртка `agy.exe` собирается встроенным компилятором .NET Framework. Обычный бинарь сохраняется как `agy.real.exe`; управляемые лаунчеры сохраняют имена и файлы, а обёртка помещается в `%USERPROFILE%\.agy-region-fixer\bin`. Старые установки с `agy.cmd` мигрируют автоматически.
+- <img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux"> systemd и `runuser` или `setpriv` (оба из `util-linux`, есть везде)
 
 ## ⚙️ Как это работает
 
@@ -116,9 +116,9 @@ flowchart LR
 
 | ОС | Событийный триггер | Резервная проверка |
 |---|---|---|
-| 🐧 Linux | systemd path-юнит с `PathChanged` | таймер systemd |
-| 🍎 macOS | launchd `WatchPaths` | отдельная задача с `StartInterval` |
-| 🪟 Windows | .NET `FileSystemWatcher`, запускается при установке и входе пользователя | задача планировщика `agy-region-fixer-heal` |
+| <img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux"> | systemd path-юнит с `PathChanged` | таймер systemd |
+| <img src="assets/c-macos.svg" height="20" align="absmiddle" alt="macOS"> | launchd `WatchPaths` | отдельная задача с `StartInterval` |
+| <img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows"> | .NET `FileSystemWatcher`, запускается при установке и входе пользователя | задача планировщика `agy-region-fixer-heal` |
 
 Перед восстановлением серия событий объединяется. Восстановитель ждёт, пока файл перестанет меняться, и проверяет размер (≥ 10 МБ; на Windows ещё и сигнатуру `MZ`). Блокировка, подготовленная копия и проверки отката снижают риск гонок и помогают сохранить предыдущую рабочую копию. Это косвенные признаки готовности: стабильный файл не доказывает, что произвольный установщик закончил обновление.
 
@@ -128,9 +128,9 @@ flowchart LR
 
 Запустить восстановление вручную:
 
-- 🐧 `sudo agy-bypass-heal`
-- 🍎 `bash ~/.agy-region-fixer/heal.sh`
-- 🪟 `powershell %USERPROFILE%\.agy-region-fixer\heal.ps1`
+- <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"> `sudo agy-bypass-heal`
+- <img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"> `bash ~/.agy-region-fixer/heal.sh`
+- <img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> `powershell %USERPROFILE%\.agy-region-fixer\heal.ps1`
 
 ## 🔐 Модель безопасности
 
@@ -146,10 +146,10 @@ flowchart LR
 
 | Переменная | По умолчанию | Назначение | ОС |
 |---|---|---|---|
-| `AGY_BYPASS_PORT` | автоматически | порт прокси | 🐧 🍎 🪟 |
-| `AGY_BYPASS_PREFIX` | `/opt/agy-region-fixer` · `~/.agy-region-fixer` | каталог установки | 🐧 🍎 |
-| `AGY_BYPASS_BIN` | поиск `agy` в `PATH` | путь к бинарю CLI | 🐧 🍎 |
-| `AGY_ADDON_URL` | raw.githubusercontent.com | откуда брать `addon.py` при pipe-установке | 🐧 🍎 🪟 |
+| `AGY_BYPASS_PORT` | автоматически | порт прокси | <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"><img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"><img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> |
+| `AGY_BYPASS_PREFIX` | `/opt/agy-region-fixer` · `~/.agy-region-fixer` | каталог установки | <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"><img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"> |
+| `AGY_BYPASS_BIN` | поиск `agy` в `PATH` | путь к бинарю CLI | <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"><img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"> |
+| `AGY_ADDON_URL` | raw.githubusercontent.com | откуда брать `addon.py` при pipe-установке | <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"><img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"><img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> |
 
 По умолчанию выбирается случайный свободный порт localhost в диапазоне `49152–65535` и сохраняется в `<каталог установки>/port`. Повторная установка использует этот высокий порт, если он доступен; иначе выбирает другой. `AGY_BYPASS_PORT` явно задаёт порт: если он занят, установка остановится с ошибкой. Фактический адрес выводится на экран и согласованно записывается в настройки прокси и всех обёрток. Ctrl+C прерывает установщик и его временные команды; уже запущенный фоновый прокси работает до запуска uninstall.
 
@@ -162,9 +162,9 @@ $env:AGY_BYPASS_PORT="8081"; powershell -ExecutionPolicy Bypass -File install.ps
 
 ## 🧹 Удаление
 
-- 🐧 `sudo /opt/agy-region-fixer/uninstall.sh`
-- 🍎 `bash ~/.agy-region-fixer/uninstall.sh`
-- 🪟 `powershell -ExecutionPolicy Bypass -File %USERPROFILE%\.agy-region-fixer\uninstall.ps1`
+- <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"> `sudo /opt/agy-region-fixer/uninstall.sh`
+- <img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"> `bash ~/.agy-region-fixer/uninstall.sh`
+- <img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> `powershell -ExecutionPolicy Bypass -File %USERPROFILE%\.agy-region-fixer\uninstall.ps1`
 
 Убирает прокси, задачи и shim; бинарь `agy` возвращается на место — даже если после прерванного апдейта он остался только как `agy.real`.
 
@@ -172,9 +172,9 @@ $env:AGY_BYPASS_PORT="8081"; powershell -ExecutionPolicy Bypass -File install.ps
 
 | ОС | Лог прокси | Журнал сервиса |
 |---|---|---|
-| 🐧 Linux | `/opt/agy-region-fixer/mitm.log` | `journalctl -u agy-region-fixer -e` |
-| 🍎 macOS | `~/.agy-region-fixer/mitm.log` | `~/.agy-region-fixer/launchd.err` |
-| 🪟 Windows | `%USERPROFILE%\.agy-region-fixer\mitm.log` | `…\mitm-stdout.log` |
+| <img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux"> | `/opt/agy-region-fixer/mitm.log` | `journalctl -u agy-region-fixer -e` |
+| <img src="assets/c-macos.svg" height="20" align="absmiddle" alt="macOS"> | `~/.agy-region-fixer/mitm.log` | `~/.agy-region-fixer/launchd.err` |
+| <img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows"> | `%USERPROFILE%\.agy-region-fixer\mitm.log` | `…\mitm-stdout.log` |
 
 🔎 **Подробный режим:** полный лог всех URL включается файлом `verbose.flag` в каталоге установки (`touch /opt/agy-region-fixer/verbose.flag`; на Windows — создай файл в `%USERPROFILE%\.agy-region-fixer`). Перезапускать прокси не нужно — флаг проверяется на каждый запрос; удалишь файл — режим выключится.
 
@@ -184,7 +184,7 @@ $env:AGY_BYPASS_PORT="8081"; powershell -ExecutionPolicy Bypass -File install.ps
 
 ## ⚠️ Ограничения
 
-- 🪟 Если Windows-версия CLI использует лаунчер, после установки открой новый терминал, чтобы обновился пользовательский `PATH`. Программы должны находить установленную обёртку `agy.exe` или запускать её по полному пути; абсолютный запуск исходного управляемого лаунчера обходит её. Системная запись `PATH` может иметь приоритет над пользовательской — проверь, какой `agy` находит приложение.
+- <img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> Если Windows-версия CLI использует лаунчер, после установки открой новый терминал, чтобы обновился пользовательский `PATH`. Программы должны находить установленную обёртку `agy.exe` или запускать её по полному пути; абсолютный запуск исходного управляемого лаунчера обходит её. Системная запись `PATH` может иметь приоритет над пользовательской — проверь, какой `agy` находит приложение.
 - 🧬 Если Google сменит формат ответа (переименует поле или уйдёт в бинарный proto) — аддон перестанет чистить; чинится одной строкой в `addon.py`.
 - 📌 Если `agy` начнёт certificate pinning (Go-клиенты почти никогда) — способ потребует переработки.
 
@@ -192,7 +192,7 @@ $env:AGY_BYPASS_PORT="8081"; powershell -ExecutionPolicy Bypass -File install.ps
 
 Задания GitHub Actions на соответствующих ОС по ссылкам ниже прошли успешно. Linux и macOS проверены на `bc1495b`; Windows — на `2cda8ef`, после изменений только в установщике Windows, тестах наблюдателя и шаге CI для Windows.
 
-| 🐧 ubuntu-latest | 🍎 macos-latest | 🪟 windows-latest |
+| <img src="assets/c-ubuntu.svg" height="20" align="absmiddle" alt="ubuntu-latest"> | <img src="assets/c-macos-latest.svg" height="20" align="absmiddle" alt="macos-latest"> | <img src="assets/c-windows-latest.svg" height="20" align="absmiddle" alt="windows-latest"> |
 |:---:|:---:|:---:|
 | [✅ systemd](https://github.com/nazavod777/agy-region-fixer/actions/runs/43772344364/job/132990856460) | [✅ launchd](https://github.com/nazavod777/agy-region-fixer/actions/runs/43772344364/job/132990856534) | [✅ HKCU Run + schtasks](https://github.com/nazavod777/agy-region-fixer/actions/runs/43773308497/job/132993835041) |
 
@@ -216,7 +216,7 @@ agy-region-fixer/
 | Роль | Кто |
 |---|---|
 | 👤 **Автор и мейнтейнер** | [**nazavod777**](https://github.com/nazavod777) |
-| 🤖 **Инструменты разработки (ИИ)** | **Claude** и **Claude Code** (Anthropic) · **Hermes** (агентный харнесс) · модели **GLM** (Z.ai) · **T3 Code** (терминал) |
+| 🤖 **Инструменты разработки (ИИ)** | <img src="assets/c-claude.svg" height="20" align="absmiddle" alt="Claude Code"> (Anthropic) · <img src="assets/c-hermes.svg" height="20" align="absmiddle" alt="Hermes"> (агентный харнесс) · модели <img src="assets/c-zai.svg" height="20" align="absmiddle" alt="GLM Z.ai"> · <img src="assets/c-t3code.svg" height="20" align="absmiddle" alt="T3 Code"> (терминал) |
 
 ИИ-инструменты использовались как помощники в разработке — спасибо их командам. Решения, ревью и ответственность за код — на авторе.
 

@@ -2,9 +2,9 @@
 
 <img src="assets/hero.svg" width="800" alt="Installer runs six steps, then agy replies BYPASS_OK"><br><br>
 
-<img src="assets/linux.svg" height="28" alt="Linux"> <img src="assets/macos.svg" height="28" alt="macOS"> <img src="assets/windows.svg" height="28" alt="Windows"><br>
-<img src="assets/bash.svg" height="28" alt="Bash"> <img src="assets/powershell.svg" height="28" alt="PowerShell"> <img src="assets/python.svg" height="28" alt="Python"><br>
-<img src="assets/mitmproxy.svg" height="28" alt="mitmproxy"> <img src="assets/selfheal.svg" height="28" alt="self-healing"> <img src="assets/noroot.svg" height="28" alt="heal runs as file owner"> <img src="assets/license.svg" height="28" alt="MIT"><br><br>
+<img src="assets/b-linux.svg" height="28" alt="Linux"> <img src="assets/b-macos.svg" height="28" alt="macOS"> <img src="assets/b-windows.svg" height="28" alt="Windows"><br>
+<img src="assets/b-bash.svg" height="28" alt="Bash"> <img src="assets/b-powershell.svg" height="28" alt="PowerShell"> <img src="assets/b-python.svg" height="28" alt="Python"><br>
+<img src="assets/b-mitmproxy.svg" height="28" alt="mitmproxy"> <img src="assets/b-selfheal.svg" height="28" alt="self-healing"> <img src="assets/b-noroot.svg" height="28" alt="heal runs as file owner"> <img src="assets/b-license.svg" height="28" alt="MIT"><br><br>
 
 <a href="README.md">🇬🇧 English</a> · <a href="README.ru.md">🇷🇺 Русский</a> · <a href="README.zh.md">🇨🇳 中文</a>
 
@@ -15,7 +15,7 @@
 
 # 🌍 agy-region-fixer
 
-> **Antigravity CLI 地区限制绕过工具** —— 一个安装脚本，支持 🐧 Linux、🍎 macOS 和 🪟 Windows，CLI 更新后依然有效。
+> **Antigravity CLI 地区限制绕过工具** —— 一个安装脚本，支持 <img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux">、<img src="assets/c-macos.svg" height="20" align="absmiddle" alt="macOS"> 和 <img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows">，CLI 更新后依然有效。
 
 Google 会根据账号所在国家限制访问。本地 MITM 代理会从 `loadCodeAssist` 响应中清除 `ineligibleTiers` 字段，CLI 只会看到 `allowedTiers` 并放行。发往 Google 的请求**不会被修改**，`agy` 二进制文件**不会被打补丁**。
 
@@ -56,21 +56,21 @@ Google 会根据账号所在国家限制访问。本地 MITM 代理会从 `loadC
 请先安装并登录 Antigravity CLI（`agy login`），然后：
 
 <table>
-<tr><td>🐧 <b>Linux</b><br><sub>systemd：Ubuntu、Debian、Kali、Fedora、Arch、openSUSE</sub></td><td>
+<tr><td width="260"><img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux"><br><sub>systemd：Ubuntu、Debian、Kali、Fedora、Arch、openSUSE</sub></td><td>
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nazavod777/agy-region-fixer/master/install.sh | sudo bash
 ```
 
 </td></tr>
-<tr><td>🍎 <b>macOS</b><br><sub>12+，需要 Xcode Command Line Tools</sub></td><td>
+<tr><td width="260"><img src="assets/c-macos.svg" height="20" align="absmiddle" alt="macOS"><br><sub>12+，需要 Xcode Command Line Tools</sub></td><td>
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nazavod777/agy-region-fixer/master/install.sh | bash
 ```
 
 </td></tr>
-<tr><td>🪟 <b>Windows 10/11</b><br><sub>python.org 的 Python 3.12/3.13，无需管理员权限</sub></td><td>
+<tr><td width="260"><img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows"><br><sub>10/11 · python.org 的 Python 3.12/3.13，无需管理员权限</sub></td><td>
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://raw.githubusercontent.com/nazavod777/agy-region-fixer/master/install.ps1)"
@@ -86,13 +86,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://raw.git
 
 ### 📋 环境要求
 
-- 🐍 Python **3.12 或 3.13**（mitmproxy 12.x 的要求），且须为包含 `ctypes`、`ssl`、`zlib` 的完整构建。安装脚本会检查 `PATH` 中所有 `python3.13`/`python3.12`/`python3`，并跳过不完整的版本（例如未安装 `libffi-dev` 就从源码编译的 Python）
-- 🌐 `curl`，以及已安装并登录的 Antigravity CLI
+- <img src="assets/c-python.svg" height="20" align="absmiddle" alt="Python"> **3.12 或 3.13**（mitmproxy 12.x 的要求），且须为包含 `ctypes`、`ssl`、`zlib` 的完整构建。安装脚本会检查 `PATH` 中所有 `python3.13`/`python3.12`/`python3`，并跳过不完整的版本（例如未安装 `libffi-dev` 就从源码编译的 Python）
+- <img src="assets/c-curl.svg" height="20" align="absmiddle" alt="curl">，以及已安装并登录的 Antigravity CLI
 - 📦 **任何方式安装的 `agy`** —— 安装脚本像你自己的 shell 一样查找它（`sudo` 会隐藏 `~/.local/bin`、`/snap/bin`、nvm、bun、cargo 等）：
-  - 普通二进制文件、npm/brew/cargo 的链接、root 所有的 `/usr/local/bin/agy` → 二进制文件被移到 `agy.real`，由 shim 取代；
-  - **snap、Nix**（不能改动的启动器）→ 启动器保持原样，在你的 `PATH` 中更靠前的位置（`~/.local/bin`）放置一个包装脚本。对于 snap，CA 证书会复制到 `~/snap/<名称>/common/agy-region-fixer`，受限应用可以读取该目录。
-- 🪟 **所有支持格式共用一个 Windows 安装脚本：** `install.ps1` 自动识别普通 EXE、npm `.cmd`/`.ps1`、WindowsApps 别名和 Scoop shim，使用 Windows 自带的 .NET Framework 编译器生成真正的 `agy.exe` 包装器。普通二进制保存为 `agy.real.exe`；受管理的启动器保留原名和文件，包装器放在 `%USERPROFILE%\.agy-region-fixer\bin`。旧的 `agy.cmd` 安装会自动迁移。
-- 🐧 Linux：systemd，以及 `runuser` 或 `setpriv`（都包含在 `util-linux` 中）
+  - <img src="assets/c-npm.svg" height="20" align="absmiddle" alt="npm"> <img src="assets/c-nodejs.svg" height="20" align="absmiddle" alt="Node.js"> <img src="assets/c-bun.svg" height="20" align="absmiddle" alt="Bun"> <img src="assets/c-homebrew.svg" height="20" align="absmiddle" alt="Homebrew"> <img src="assets/c-cargo.svg" height="20" align="absmiddle" alt="Cargo"> 普通二进制文件、npm/brew/cargo 的链接、root 所有的 `/usr/local/bin/agy` → 二进制文件被移到 `agy.real`，由 shim 取代；
+  - <img src="assets/c-snap.svg" height="20" align="absmiddle" alt="Snap"> <img src="assets/c-nix.svg" height="20" align="absmiddle" alt="Nix"> **snap、Nix**（不能改动的启动器）→ 启动器保持原样，在你的 `PATH` 中更靠前的位置（`~/.local/bin`）放置一个包装脚本。对于 snap，CA 证书会复制到 `~/snap/<名称>/common/agy-region-fixer`，受限应用可以读取该目录。
+- <img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows"> **所有支持格式共用一个 Windows 安装脚本：** `install.ps1` 自动识别普通 EXE、npm `.cmd`/`.ps1`、WindowsApps 别名和 Scoop shim，使用 Windows 自带的 .NET Framework 编译器生成真正的 `agy.exe` 包装器。普通二进制保存为 `agy.real.exe`；受管理的启动器保留原名和文件，包装器放在 `%USERPROFILE%\.agy-region-fixer\bin`。旧的 `agy.cmd` 安装会自动迁移。
+- <img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux"> systemd，以及 `runuser` 或 `setpriv`（都包含在 `util-linux` 中）
 
 ## ⚙️ 工作原理
 
@@ -116,9 +116,9 @@ CLI 更新后，文件系统事件会触发 shim 修复。所有平台都保留�
 
 | 系统 | 事件触发方式 | 备用检查 |
 |---|---|---|
-| 🐧 Linux | 使用 `PathChanged` 的 systemd path 单元 | systemd 定时器 |
-| 🍎 macOS | launchd `WatchPaths` | 独立的 `StartInterval` 任务 |
-| 🪟 Windows | .NET `FileSystemWatcher`，安装时及用户登录时启动 | 计划任务 `agy-region-fixer-heal` |
+| <img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux"> | 使用 `PathChanged` 的 systemd path 单元 | systemd 定时器 |
+| <img src="assets/c-macos.svg" height="20" align="absmiddle" alt="macOS"> | launchd `WatchPaths` | 独立的 `StartInterval` 任务 |
+| <img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows"> | .NET `FileSystemWatcher`，安装时及用户登录时启动 | 计划任务 `agy-region-fixer-heal` |
 
 连续事件会先合并，再执行修复。恢复程序等待文件停止变化，并检查大小（≥ 10 MB；Windows 上还检查 `MZ` 签名）。锁、暂存副本和回滚检查用于降低竞争风险并保留先前可用的副本。这些只是就绪状态的间接判断：文件暂时稳定，并不能证明任意更新程序已完成更新。
 
@@ -128,9 +128,9 @@ CLI 更新后，文件系统事件会触发 shim 修复。所有平台都保留�
 
 手动运行修复：
 
-- 🐧 `sudo agy-bypass-heal`
-- 🍎 `bash ~/.agy-region-fixer/heal.sh`
-- 🪟 `powershell %USERPROFILE%\.agy-region-fixer\heal.ps1`
+- <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"> `sudo agy-bypass-heal`
+- <img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"> `bash ~/.agy-region-fixer/heal.sh`
+- <img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> `powershell %USERPROFILE%\.agy-region-fixer\heal.ps1`
 
 ## 🔐 安全模型
 
@@ -146,10 +146,10 @@ CLI 更新后，文件系统事件会触发 shim 修复。所有平台都保留�
 
 | 变量 | 默认值 | 用途 | 系统 |
 |---|---|---|---|
-| `AGY_BYPASS_PORT` | 自动选择 | 代理端口 | 🐧 🍎 🪟 |
-| `AGY_BYPASS_PREFIX` | `/opt/agy-region-fixer` · `~/.agy-region-fixer` | 安装目录 | 🐧 🍎 |
-| `AGY_BYPASS_BIN` | 在 `PATH` 中查找 `agy` | CLI 二进制路径 | 🐧 🍎 |
-| `AGY_ADDON_URL` | raw.githubusercontent.com | 管道安装时下载 `addon.py` 的地址 | 🐧 🍎 🪟 |
+| `AGY_BYPASS_PORT` | 自动选择 | 代理端口 | <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"><img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"><img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> |
+| `AGY_BYPASS_PREFIX` | `/opt/agy-region-fixer` · `~/.agy-region-fixer` | 安装目录 | <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"><img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"> |
+| `AGY_BYPASS_BIN` | 在 `PATH` 中查找 `agy` | CLI 二进制路径 | <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"><img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"> |
+| `AGY_ADDON_URL` | raw.githubusercontent.com | 管道安装时下载 `addon.py` 的地址 | <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"><img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"><img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> |
 
 默认从 `49152–65535` 中随机选择空闲的 localhost 端口，并保存到 `<安装目录>/port`。重新安装会尽量复用该高位端口；若不可用则重新选择。`AGY_BYPASS_PORT` 显式指定端口，占用时安装会报错。安装脚本会显示实际地址，并同步更新代理和所有包装脚本。Ctrl+C 会中断安装脚本及其临时命令；已启动的后台代理会持续运行，直到执行卸载脚本。
 
@@ -162,9 +162,9 @@ $env:AGY_BYPASS_PORT="8081"; powershell -ExecutionPolicy Bypass -File install.ps
 
 ## 🧹 卸载
 
-- 🐧 `sudo /opt/agy-region-fixer/uninstall.sh`
-- 🍎 `bash ~/.agy-region-fixer/uninstall.sh`
-- 🪟 `powershell -ExecutionPolicy Bypass -File %USERPROFILE%\.agy-region-fixer\uninstall.ps1`
+- <img src="assets/i-linux.svg" height="20" align="absmiddle" alt="Linux"> `sudo /opt/agy-region-fixer/uninstall.sh`
+- <img src="assets/i-macos.svg" height="20" align="absmiddle" alt="macOS"> `bash ~/.agy-region-fixer/uninstall.sh`
+- <img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> `powershell -ExecutionPolicy Bypass -File %USERPROFILE%\.agy-region-fixer\uninstall.ps1`
 
 会移除代理、任务和 shim；`agy` 二进制文件会回到原位 —— 即使更新中断后它只剩下 `agy.real`。
 
@@ -172,9 +172,9 @@ $env:AGY_BYPASS_PORT="8081"; powershell -ExecutionPolicy Bypass -File install.ps
 
 | 系统 | 代理日志 | 服务日志 |
 |---|---|---|
-| 🐧 Linux | `/opt/agy-region-fixer/mitm.log` | `journalctl -u agy-region-fixer -e` |
-| 🍎 macOS | `~/.agy-region-fixer/mitm.log` | `~/.agy-region-fixer/launchd.err` |
-| 🪟 Windows | `%USERPROFILE%\.agy-region-fixer\mitm.log` | `…\mitm-stdout.log` |
+| <img src="assets/c-linux.svg" height="20" align="absmiddle" alt="Linux"> | `/opt/agy-region-fixer/mitm.log` | `journalctl -u agy-region-fixer -e` |
+| <img src="assets/c-macos.svg" height="20" align="absmiddle" alt="macOS"> | `~/.agy-region-fixer/mitm.log` | `~/.agy-region-fixer/launchd.err` |
+| <img src="assets/c-windows.svg" height="20" align="absmiddle" alt="Windows"> | `%USERPROFILE%\.agy-region-fixer\mitm.log` | `…\mitm-stdout.log` |
 
 🔎 **详细模式：** 在安装目录中创建 `verbose.flag` 文件即可记录所有 URL（`touch /opt/agy-region-fixer/verbose.flag`；Windows 上在 `%USERPROFILE%\.agy-region-fixer` 中创建该文件）。无需重启代理 —— 每个请求都会检查该文件；删除文件即可关闭。
 
@@ -184,7 +184,7 @@ $env:AGY_BYPASS_PORT="8081"; powershell -ExecutionPolicy Bypass -File install.ps
 
 ## ⚠️ 限制
 
-- 🪟 Windows 启动器模式安装后，请打开新终端以使用更新后的用户 `PATH`。程序需要解析到已安装的 `agy.exe` 包装器，或通过其完整路径启动；直接调用原始启动器的绝对路径会绕过包装器。系统 `PATH` 可能优先于用户 `PATH`，请检查应用实际找到的 `agy`。
+- <img src="assets/i-windows.svg" height="20" align="absmiddle" alt="Windows"> Windows 启动器模式安装后，请打开新终端以使用更新后的用户 `PATH`。程序需要解析到已安装的 `agy.exe` 包装器，或通过其完整路径启动；直接调用原始启动器的绝对路径会绕过包装器。系统 `PATH` 可能优先于用户 `PATH`，请检查应用实际找到的 `agy`。
 - 🧬 如果 Google 更改响应格式（字段改名或改用二进制 proto），插件将停止清理；在 `addon.py` 中改一行即可修复。
 - 📌 如果 `agy` 启用证书固定（Go 客户端几乎从不这样做），此方案需要重做。
 
@@ -192,7 +192,7 @@ $env:AGY_BYPASS_PORT="8081"; powershell -ExecutionPolicy Bypass -File install.ps
 
 下方链接中的各系统原生 GitHub Actions 任务均已通过。Linux 和 macOS 在 `bc1495b` 上验证；Windows 在 `2cda8ef` 上通过，后续改动仅涉及 Windows 安装脚本、监视程序测试和 Windows CI 步骤。
 
-| 🐧 ubuntu-latest | 🍎 macos-latest | 🪟 windows-latest |
+| <img src="assets/c-ubuntu.svg" height="20" align="absmiddle" alt="ubuntu-latest"> | <img src="assets/c-macos-latest.svg" height="20" align="absmiddle" alt="macos-latest"> | <img src="assets/c-windows-latest.svg" height="20" align="absmiddle" alt="windows-latest"> |
 |:---:|:---:|:---:|
 | [✅ systemd](https://github.com/nazavod777/agy-region-fixer/actions/runs/43772344364/job/132990856460) | [✅ launchd](https://github.com/nazavod777/agy-region-fixer/actions/runs/43772344364/job/132990856534) | [✅ HKCU Run + schtasks](https://github.com/nazavod777/agy-region-fixer/actions/runs/43773308497/job/132993835041) |
 
@@ -216,7 +216,7 @@ agy-region-fixer/
 | 角色 | 成员 |
 |---|---|
 | 👤 **作者与维护者** | [**nazavod777**](https://github.com/nazavod777) |
-| 🤖 **开发所用 AI 工具** | **Claude** 与 **Claude Code**（Anthropic）· **Hermes**（智能体 harness）· **GLM** 模型（Z.ai）· **T3 Code**（终端） |
+| 🤖 **开发所用 AI 工具** | <img src="assets/c-claude.svg" height="20" align="absmiddle" alt="Claude Code">（Anthropic）· <img src="assets/c-hermes.svg" height="20" align="absmiddle" alt="Hermes">（智能体 harness）· <img src="assets/c-zai.svg" height="20" align="absmiddle" alt="GLM Z.ai"> 模型 · <img src="assets/c-t3code.svg" height="20" align="absmiddle" alt="T3 Code">（终端） |
 
 以上 AI 工具仅作为开发助手使用，感谢各团队。设计决策、审查和代码责任均由作者承担。
 
